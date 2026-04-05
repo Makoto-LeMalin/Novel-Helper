@@ -356,6 +356,10 @@ body {
   cursor: pointer;
 }
 
+.modal-backdrop.modal-backdrop-priority {
+  z-index: 150;
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -423,6 +427,113 @@ body {
 }
 
 .modal .actions button.primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: #0a0c10;
+  font-weight: 600;
+}
+
+.modal .actions button.danger {
+  background: #5c2a2a;
+  border-color: #8b4040;
+  color: #fde8e8;
+}
+
+.chat-history-hint {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.chat-history-hint button {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  font: inherit;
+}
+
+.version-graph-panel {
+  margin: 0 4px 8px;
+}
+
+.version-graph-scroll {
+  max-height: 360px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #12151a;
+}
+
+.version-graph-canvas {
+  margin: 0 auto;
+}
+
+.version-graph-svg {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+}
+
+.version-graph-node-hit {
+  cursor: pointer;
+  z-index: 1;
+}
+
+.version-graph-node-hit:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.version-graph-popover {
+  min-width: 260px;
+  max-width: min(320px, 92vw);
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #1a1f28;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  font-size: 12px;
+}
+
+.version-graph-popover-title {
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.version-graph-popover-meta {
+  color: var(--muted);
+  line-height: 1.45;
+  margin-bottom: 10px;
+}
+
+.version-graph-popover-mono {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.version-graph-popover-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.version-graph-popover-actions button {
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: #2a3340;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.version-graph-popover-actions button.primary {
   background: var(--accent);
   border-color: transparent;
   color: #0a0c10;

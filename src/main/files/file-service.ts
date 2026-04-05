@@ -9,6 +9,195 @@ export function isUnderNovel(rel: string): boolean {
   return n === NOVEL_DIR || n.startsWith(`${NOVEL_DIR}/`)
 }
 
+/** Reject empty, `..` segments, and `.novel`. */
+export function normalizeSafeWorkspaceRelPath(raw: unknown): string | null {
+  const s =
+    typeof raw === 'string'
+      ? raw
+      : raw != null && (typeof raw === 'number' || typeof raw === 'boolean')
+        ? String(raw)
+        : ''
+  const n = s.replace(/\\/g, '/').replace(/^\//, '').trim()
+  if (!n) return null
+  for (const seg of n.split('/')) {
+    if (seg === '..') return null
+  }
+  if (isUnderNovel(n)) return null
+  return n
+}
+
+export const WORKSPACE_TOOL_MAX_READ_CHARS = 56_000
+export const WORKSPACE_TOOL_MAX_FILE_BYTES = 2_000_000
+export const WORKSPACE_SEARCH_MAX_HITS = 80
+export const WORKSPACE_SEARCH_MAX_FILE_BYTES = 400_000
+export const WORKSPACE_LIST_MAX_PATHS = 8_000
+
+export type WorkspaceSearchHit = {
+  path: string
+  line: number
+  excerpt: string
+}
+
+export async function readWorkspaceFileForTool(
+  workspaceRoot: string,
+  relPath: string,
+  lineStart?: number | null,
+  lineEnd?: number | null
+): Promise<
+  | {
+      ok: true
+      path: string
+      content: string
+      total_lines: number
+      range?: { start: number; end: number }
+      truncated?: boolean
+    }
+  | { ok: false; error: string }
+> {
+  let buf: Buffer
+  try {
+    buf = await readWorkspaceFile(workspaceRoot, relPath)
+  } catch {
+    return { ok: false, error: 'File not found or not readable' }
+  }
+  if (buf.length > WORKSPACE_TOOL_MAX_FILE_BYTES) {
+    return {
+      ok: false,
+      error: `File exceeds ${WORKSPACE_TOOL_MAX_FILE_BYTES} bytes; use line_start and line_end to read a range.`
+    }
+  }
+  const text = buf.toString('utf8')
+  const lines = text.split(/\r?\n/)
+  const total = Math.max(1, lines.length)
+  const hasRange =
+    (lineStart != null && lineStart >= 1) || (lineEnd != null && lineEnd >= 1)
+  let start = 1
+  let end = total
+  if (hasRange) {
+    start =
+      lineStart != null && lineStart >= 1 ? Math.min(lineStart, total) : 1
+    end = lineEnd != null && lineEnd >= 1 ? Math.min(lineEnd, total) : total
+    if (end < start) end = start
+  }
+  const sliceLines = lines.slice(start - 1, end)
+  const body = hasRange
+    ? sliceLines
+        .map((line, i) => `${String(start + i).padStart(6)}| ${line}`)
+        .join('\n')
+    : text
+  let truncated = false
+  let content = body
+  if (content.length > WORKSPACE_TOOL_MAX_READ_CHARS) {
+    content =
+      content.slice(0, WORKSPACE_TOOL_MAX_READ_CHARS) +
+      '\n\n…(truncated; narrow line_start/line_end or read in chunks)'
+    truncated = true
+  }
+  return {
+    ok: true,
+    path: relPath,
+    content,
+    total_lines: total,
+    range: hasRange ? { start, end } : undefined,
+    truncated
+  }
+}
+
+export async function listWorkspaceFilesWithPrefix(
+  workspaceRoot: string,
+  pathPrefix: string | null | undefined
+): Promise<{
+  paths: string[]
+  truncated: boolean
+}> {
+  const all = await listWorkspaceFiles(workspaceRoot)
+  let paths = all
+  if (pathPrefix != null && String(pathPrefix).trim() !== '') {
+    const p = String(pathPrefix).replace(/\\/g, '/').replace(/^\//, '').trim()
+    const pre = p.endsWith('/') ? p.slice(0, -1) : p
+    paths = all.filter(
+      (x) => x === pre || x.startsWith(`${pre}/`)
+    )
+  }
+  const truncated = paths.length > WORKSPACE_LIST_MAX_PATHS
+  if (truncated) {
+    paths = paths.slice(0, WORKSPACE_LIST_MAX_PATHS)
+  }
+  return { paths, truncated }
+}
+
+export async function searchWorkspaceLiteral(
+  workspaceRoot: string,
+  query: string,
+  options?: {
+    pathPrefix?: string | null
+    caseInsensitive?: boolean
+    maxHits?: number
+    maxFileBytes?: number
+  }
+): Promise<
+  | { ok: true; hits: WorkspaceSearchHit[]; truncated: boolean }
+  | { ok: false; error: string }
+> {
+  const q = query.trim()
+  if (!q) return { ok: false, error: 'query must be non-empty' }
+  const maxHits = options?.maxHits ?? WORKSPACE_SEARCH_MAX_HITS
+  const maxFileBytes =
+    options?.maxFileBytes ?? WORKSPACE_SEARCH_MAX_FILE_BYTES
+  const ci = options?.caseInsensitive === true
+  const needle = ci ? q.toLowerCase() : q
+  const { paths } = await listWorkspaceFilesWithPrefix(
+    workspaceRoot,
+    options?.pathPrefix
+  )
+  const hits: WorkspaceSearchHit[] = []
+  for (const rel of paths) {
+    if (hits.length >= maxHits) break
+    let buf: Buffer
+    try {
+      buf = await readWorkspaceFile(workspaceRoot, rel)
+    } catch {
+      continue
+    }
+    if (buf.length > maxFileBytes) continue
+    const text = buf.toString('utf8')
+    const lines = text.split(/\r?\n/)
+    for (let i = 0; i < lines.length; i++) {
+      if (hits.length >= maxHits) break
+      const line = lines[i]
+      const hay = ci ? line.toLowerCase() : line
+      if (hay.includes(needle)) {
+        hits.push({
+          path: rel,
+          line: i + 1,
+          excerpt: line.length > 220 ? `${line.slice(0, 220)}…` : line
+        })
+      }
+    }
+  }
+  return { ok: true, hits, truncated: hits.length >= maxHits }
+}
+
+export async function deleteWorkspaceFileIfExists(
+  workspaceRoot: string,
+  relPath: string
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const full = join(workspaceRoot, relPath)
+  try {
+    await unlink(full)
+    return { ok: true }
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') {
+      return { ok: false, error: 'File does not exist' }
+    }
+    return {
+      ok: false,
+      error: e instanceof Error ? e.message : String(e)
+    }
+  }
+}
+
 async function walkFiles(
   root: string,
   base: string,

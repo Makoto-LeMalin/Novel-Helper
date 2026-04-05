@@ -11,6 +11,10 @@ export class ProjectState {
    * instead of the branch tip (avoids attaching to the wrong timeline).
    */
   restoredBaseNodeId: string | null = null
+  /**
+   * 跳转到「仍有子节点」的历史节点后，下一次对话或提交须先新建分支；复制对话时只带到该节点的 conversationCutSeq。
+   */
+  pendingForkBeforeNextCommit = false
   settings: AppSettings = { ...defaultSettings }
 
   setWorkspace(path: string | null): void {

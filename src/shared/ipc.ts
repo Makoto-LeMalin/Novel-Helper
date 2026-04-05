@@ -4,6 +4,9 @@ export type WorkspaceInfo = {
   path: string
   currentBranchId: string
   currentNodeId: string
+  pendingForkBeforeNextCommit: boolean
+  /** True when conversation list is capped to a restored node's cut. */
+  historyViewActive: boolean
 }
 
 export type BranchRecord = {
@@ -18,6 +21,7 @@ export type NodeRecord = {
   branchId: string
   createdAt: number
   label: string
+  conversationCutSeq: number
 }
 
 export type GraphEdge = { from: string; to: string }

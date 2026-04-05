@@ -7,6 +7,22 @@ import {
   pickPatchWorkspaceFields
 } from './novel-tools'
 
+const DISK_MUTATING_TOOLS = new Set([
+  'patch_workspace_file',
+  'write_workspace_file',
+  'delete_workspace_file'
+])
+
+function parseToolResultJson(
+  toolContent: string
+): Record<string, unknown> | null {
+  try {
+    return JSON.parse(toolContent) as Record<string, unknown>
+  } catch {
+    return null
+  }
+}
+
 export type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string }
 
 export type ToolCall = {
@@ -257,20 +273,74 @@ function summarizeToolExecution(
   args: Record<string, unknown>,
   toolContent: string
 ): { ok: boolean; summary: string; path?: string } {
+  const parsed = parseToolResultJson(toolContent)
+
   if (name === 'patch_workspace_file') {
-    try {
-      const parsed = JSON.parse(toolContent) as { ok?: boolean; error?: string }
-      const { path: rel } = pickPatchWorkspaceFields(args)
-      const ok = !!parsed.ok
-      return {
-        ok,
-        summary: ok ? `已更新 ${rel}` : (parsed.error ?? '修补失败'),
-        path: rel || undefined
-      }
-    } catch {
-      return { ok: false, summary: '工具返回无效' }
+    if (!parsed) return { ok: false, summary: '工具返回无效' }
+    const { path: rel } = pickPatchWorkspaceFields(args)
+    const ok = parsed.ok === true
+    return {
+      ok,
+      summary: ok ? `已更新 ${rel}` : String(parsed.error ?? '修补失败'),
+      path: rel || undefined
     }
   }
+
+  if (name === 'read_workspace_file') {
+    if (!parsed) return { ok: false, summary: '工具返回无效' }
+    const ok = parsed.ok === true
+    const rel = typeof parsed.path === 'string' ? parsed.path : ''
+    return {
+      ok,
+      summary: ok ? `已读取 ${rel || '文件'}` : String(parsed.error ?? '读取失败'),
+      path: rel || undefined
+    }
+  }
+
+  if (name === 'list_workspace_files') {
+    if (!parsed) return { ok: false, summary: '工具返回无效' }
+    const ok = parsed.ok === true
+    const n = typeof parsed.count === 'number' ? parsed.count : 0
+    const truncated = parsed.truncated === true ? '（列表已截断）' : ''
+    return {
+      ok,
+      summary: ok ? `列出 ${n} 个文件${truncated}` : String(parsed.error ?? '列出失败')
+    }
+  }
+
+  if (name === 'search_workspace') {
+    if (!parsed) return { ok: false, summary: '工具返回无效' }
+    const ok = parsed.ok === true
+    const n = typeof parsed.count === 'number' ? parsed.count : 0
+    const truncated = parsed.truncated === true ? '（结果已截断）' : ''
+    return {
+      ok,
+      summary: ok ? `搜索命中 ${n} 处${truncated}` : String(parsed.error ?? '搜索失败')
+    }
+  }
+
+  if (name === 'write_workspace_file') {
+    if (!parsed) return { ok: false, summary: '工具返回无效' }
+    const ok = parsed.ok === true
+    const rel = typeof parsed.path === 'string' ? parsed.path : ''
+    return {
+      ok,
+      summary: ok ? `已写入 ${rel}` : String(parsed.error ?? '写入失败'),
+      path: rel || undefined
+    }
+  }
+
+  if (name === 'delete_workspace_file') {
+    if (!parsed) return { ok: false, summary: '工具返回无效' }
+    const ok = parsed.ok === true
+    const rel = typeof parsed.path === 'string' ? parsed.path : ''
+    return {
+      ok,
+      summary: ok ? `已删除 ${rel}` : String(parsed.error ?? '删除失败'),
+      path: rel || undefined
+    }
+  }
+
   return {
     ok: true,
     summary:
@@ -320,14 +390,25 @@ export async function runChatWithToolLoop(
       })
       emit({ type: 'generating', phase: 'tools', round })
       for (const tc of toolCalls) {
-        const salvaged = parsePatchWorkspaceFileArgs(tc.function.arguments)
         let args: Record<string, unknown> = {}
-        if (salvaged) {
-          args = {
-            path: salvaged.path,
-            old_text: salvaged.oldText,
-            new_text: salvaged.newText,
-            replace_all: salvaged.replaceAll
+        if (tc.function.name === 'patch_workspace_file') {
+          const salvaged = parsePatchWorkspaceFileArgs(tc.function.arguments)
+          if (salvaged) {
+            args = {
+              path: salvaged.path,
+              old_text: salvaged.oldText,
+              new_text: salvaged.newText,
+              replace_all: salvaged.replaceAll
+            }
+          } else {
+            try {
+              args = JSON.parse(tc.function.arguments || '{}') as Record<
+                string,
+                unknown
+              >
+            } catch {
+              args = {}
+            }
           }
         } else {
           try {
@@ -348,14 +429,11 @@ export async function runChatWithToolLoop(
         let toolContent: string
         try {
           toolContent = await executeTool(tc.function.name, args)
-          if (tc.function.name === 'patch_workspace_file') {
-            try {
-              const parsed = JSON.parse(toolContent) as { ok?: boolean }
-              const p = pickPatchWorkspaceFields(args).path
-              if (parsed.ok && p) writtenPaths.push(p)
-            } catch {
-              /* ignore */
-            }
+          if (DISK_MUTATING_TOOLS.has(tc.function.name)) {
+            const pr = parseToolResultJson(toolContent)
+            const p =
+              pr && pr.ok === true && typeof pr.path === 'string' ? pr.path : ''
+            if (p) writtenPaths.push(p)
           }
         } catch (err) {
           toolContent = JSON.stringify({

@@ -1,5 +1,6 @@
 import type { WorkspaceInfo, VersionGraph, VersionStatus, AppSettings } from './ipc'
 import type { ChatStreamEvent, ChatTurnBlock } from './chat-stream'
+import type { SessionRendererPayload, SessionRestoreResult } from './session'
 
 export type ChatMessageRow = {
   role: string
@@ -17,6 +18,12 @@ export type NovelApi = {
   listTree: () => Promise<string[]>
   versionGraph: () => Promise<VersionGraph>
   checkpoint: (label: string) => Promise<{ nodeId: string }>
+  checkpointWithNewBranch: (payload: {
+    newBranchName: string
+    label: string
+  }) => Promise<{ nodeId: string }>
+  forkAfterJump: (newBranchName: string) => Promise<{ branchId: string }>
+  deleteVersionNode: (nodeId: string) => Promise<{ deletedIds: string[] }>
   forkBranch: (
     fromNodeId: string,
     name: string
@@ -42,4 +49,6 @@ export type NovelApi = {
    * 传 null 可清除。
    */
   setEditorFlushHandler: (fn: (() => Promise<void>) | null) => void
+  restoreLastSession: () => Promise<SessionRestoreResult>
+  saveSessionSnapshot: (payload: SessionRendererPayload) => Promise<void>
 }

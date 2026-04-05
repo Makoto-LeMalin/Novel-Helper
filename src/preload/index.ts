@@ -50,6 +50,14 @@ const novel: NovelApi = {
     ipcRenderer.invoke('novel:versionGraph'),
   checkpoint: (label: string): Promise<{ nodeId: string }> =>
     ipcRenderer.invoke('novel:checkpoint', label),
+  checkpointWithNewBranch: (
+    payload: { newBranchName: string; label: string }
+  ): Promise<{ nodeId: string }> =>
+    ipcRenderer.invoke('novel:checkpointWithNewBranch', payload),
+  forkAfterJump: (newBranchName: string): Promise<{ branchId: string }> =>
+    ipcRenderer.invoke('novel:forkAfterJump', newBranchName),
+  deleteVersionNode: (nodeId: string): Promise<{ deletedIds: string[] }> =>
+    ipcRenderer.invoke('novel:deleteVersionNode', nodeId),
   forkBranch: (
     fromNodeId: string,
     name: string
@@ -93,7 +101,10 @@ const novel: NovelApi = {
   },
   setEditorFlushHandler: (fn: (() => Promise<void>) | null): void => {
     editorFlushHandler = fn
-  }
+  },
+  restoreLastSession: () => ipcRenderer.invoke('novel:restoreLastSession'),
+  saveSessionSnapshot: (payload) =>
+    ipcRenderer.invoke('novel:saveSessionSnapshot', payload)
 }
 
 contextBridge.exposeInMainWorld('novel', novel)

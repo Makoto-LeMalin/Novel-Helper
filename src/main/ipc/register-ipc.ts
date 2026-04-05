@@ -1,20 +1,46 @@
 import { BrowserWindow, ipcMain, dialog, type WebContents } from 'electron'
+import { existsSync } from 'fs'
 import { join, relative } from 'path'
-import { readdir, readFile } from 'fs/promises'
+import { readdir, readFile, stat } from 'fs/promises'
 import type { ProjectState } from '../state/project-state'
 import { SnapshotVersionStore } from '../version/snapshot-version-store'
 import { MemoryService } from '../memory/memory-service'
 import { runChatWithToolLoop } from '../llm/openai-client'
-import { pickPatchWorkspaceFields } from '../llm/novel-tools'
+import {
+  pickDeleteWorkspaceFields,
+  pickListWorkspaceFields,
+  pickPatchWorkspaceFields,
+  pickReadWorkspaceFields,
+  pickSearchWorkspaceFields,
+  pickWriteWorkspaceFields
+} from '../llm/novel-tools'
 import { saveSettings } from '../persistence/settings-store'
-import { isUnderNovel, patchWorkspaceFile, writeWorkspaceFile } from '../files/file-service'
+import {
+  loadSessionSnapshot,
+  saveSessionSnapshot
+} from '../persistence/session-store'
+import {
+  deleteWorkspaceFileIfExists,
+  isUnderNovel,
+  listWorkspaceFilesWithPrefix,
+  patchWorkspaceFile,
+  readWorkspaceFileForTool,
+  searchWorkspaceLiteral,
+  writeWorkspaceFile
+} from '../files/file-service'
 import {
   CHAT_DONE_CHANNEL,
   CHAT_ERROR_CHANNEL,
   FLUSH_EDITOR_REQUEST_CHANNEL,
   FLUSH_EDITOR_DONE_CHANNEL,
-  type AppSettings
+  type AppSettings,
+  type WorkspaceInfo
 } from '../../shared/ipc'
+import type {
+  SessionRendererPayload,
+  SessionRestoreResult,
+  SessionSnapshotV1
+} from '../../shared/session'
 import {
   CHAT_STREAM_EVENT_CHANNEL,
   type ChatStreamEvent
@@ -41,6 +67,97 @@ function awaitEditorFlushFromRenderer(
     ipcMain.on(FLUSH_EDITOR_DONE_CHANNEL, onDone)
     sender.send(FLUSH_EDITOR_REQUEST_CHANNEL, requestId)
   })
+}
+
+async function openWorkspaceCore(
+  project: ProjectState,
+  version: SnapshotVersionStore,
+  memory: MemoryService,
+  absPath: string,
+  mode: 'fresh' | 'restore',
+  restore?: Pick<
+    SessionSnapshotV1,
+    | 'currentBranchId'
+    | 'conversationViewMaxSeq'
+    | 'restoredBaseNodeId'
+    | 'pendingForkBeforeNextCommit'
+  >
+): Promise<WorkspaceInfo> {
+  project.setWorkspace(absPath)
+  version.open(absPath)
+  memory.open(absPath)
+  await version.hydrateEmptyInitialSnapshot()
+  const branches = version.listBranches()
+  if (mode === 'fresh') {
+    const main = branches.find((b) => b.name === 'main') ?? branches[0]
+    project.setCurrentBranch(main?.id ?? null)
+    project.conversationViewMaxSeq = null
+    project.restoredBaseNodeId = null
+    project.pendingForkBeforeNextCommit = false
+    const bid = main?.id ?? null
+    return {
+      path: absPath,
+      currentBranchId: bid ?? '',
+      currentNodeId: bid ? version.getBranchTip(bid) : '',
+      pendingForkBeforeNextCommit: false,
+      historyViewActive: false
+    }
+  }
+  let bid = restore?.currentBranchId
+  if (!bid || !branches.some((b) => b.id === bid)) {
+    const main = branches.find((b) => b.name === 'main') ?? branches[0]
+    bid = main?.id ?? null
+  }
+  project.setCurrentBranch(bid)
+  project.conversationViewMaxSeq =
+    restore?.conversationViewMaxSeq !== undefined
+      ? restore.conversationViewMaxSeq
+      : null
+  project.restoredBaseNodeId =
+    restore?.restoredBaseNodeId !== undefined
+      ? restore.restoredBaseNodeId
+      : null
+  project.pendingForkBeforeNextCommit = project.restoredBaseNodeId
+    ? version.nodeHasChild(project.restoredBaseNodeId)
+    : false
+  return {
+    path: absPath,
+    currentBranchId: bid ?? '',
+    currentNodeId: bid ? version.getBranchTip(bid) : '',
+    pendingForkBeforeNextCommit: project.pendingForkBeforeNextCommit,
+    historyViewActive: project.conversationViewMaxSeq != null
+  }
+}
+
+/** 工作区脏检查基准：跳转查看某节点时与「该节点」快照比，否则与分支 tip 比。 */
+function baselineNodeIdForWorkspaceDirty(
+  project: ProjectState,
+  version: SnapshotVersionStore
+): string | null {
+  if (!project.currentBranchId) return null
+  return project.restoredBaseNodeId != null
+    ? project.restoredBaseNodeId
+    : version.getBranchTip(project.currentBranchId)
+}
+
+function trimMemoryToVersionTips(
+  memory: MemoryService,
+  version: SnapshotVersionStore
+): void {
+  for (const b of version.listBranches()) {
+    const cut = version.getNode(b.tipNodeId).conversationCutSeq
+    memory.trimAfterConversationCut(b.id, cut)
+  }
+}
+
+function resolveMainBranchRecord(
+  version: SnapshotVersionStore
+): { id: string; tipNodeId: string } {
+  const branches = version.listBranches()
+  if (branches.length === 0) throw new Error('No branches')
+  const main =
+    branches.find((b) => b.name === 'main') ?? branches[0]
+  return { id: main.id, tipNodeId: main.tipNodeId }
 }
 
 function notifyChatError(sender: WebContents, msg: string): void {
@@ -75,29 +192,85 @@ export function registerIpc(
       properties: ['openDirectory']
     })
     if (canceled || !filePaths[0]) return null
-    const p = filePaths[0]
-    project.setWorkspace(p)
-    version.open(p)
-    memory.open(p)
-    await version.hydrateEmptyInitialSnapshot()
-    const branches = version.listBranches()
-    const main = branches.find((b) => b.name === 'main') ?? branches[0]
-    project.setCurrentBranch(main?.id ?? null)
-    project.conversationViewMaxSeq = null
-    project.restoredBaseNodeId = null
-    return {
-      path: p,
-      currentBranchId: main?.id ?? '',
-      currentNodeId: main ? version.getBranchTip(main.id) : ''
-    }
+    return openWorkspaceCore(project, version, memory, filePaths[0], 'fresh')
   })
+
+  ipcMain.handle(
+    'novel:restoreLastSession',
+    async (): Promise<SessionRestoreResult> => {
+      const snap = await loadSessionSnapshot(getUserData())
+      if (!snap) return { ok: false, reason: 'no_session' }
+      if (!existsSync(snap.workspacePath)) {
+        return { ok: false, reason: 'path_missing' }
+      }
+      try {
+        const st = await stat(snap.workspacePath)
+        if (!st.isDirectory()) return { ok: false, reason: 'not_dir' }
+      } catch {
+        return { ok: false, reason: 'stat_failed' }
+      }
+      try {
+        const w = await openWorkspaceCore(
+          project,
+          version,
+          memory,
+          snap.workspacePath,
+          'restore',
+          {
+            currentBranchId: snap.currentBranchId,
+            conversationViewMaxSeq: snap.conversationViewMaxSeq,
+            restoredBaseNodeId: snap.restoredBaseNodeId,
+            pendingForkBeforeNextCommit:
+              snap.pendingForkBeforeNextCommit ?? false
+          }
+        )
+        return {
+          ok: true,
+          workspace: w,
+          historyBanner: snap.historyBanner,
+          activeFile: snap.activeFile,
+          editorContent: snap.editorContent,
+          editorDiskBaseline: snap.editorDiskBaseline,
+          fileBuffers: snap.fileBuffers,
+          editorView: snap.editorView
+        }
+      } catch {
+        return { ok: false, reason: 'open_failed' }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'novel:saveSessionSnapshot',
+    async (_e, rendererPart: SessionRendererPayload): Promise<void> => {
+      if (!project.workspacePath || !project.currentBranchId) return
+      const tip = version.getBranchTip(project.currentBranchId)
+      const full: SessionSnapshotV1 = {
+        v: 1,
+        workspacePath: project.workspacePath,
+        currentBranchId: project.currentBranchId,
+        currentNodeId: tip,
+        conversationViewMaxSeq: project.conversationViewMaxSeq,
+        restoredBaseNodeId: project.restoredBaseNodeId,
+        pendingForkBeforeNextCommit: project.pendingForkBeforeNextCommit,
+        historyBanner: rendererPart.historyBanner,
+        activeFile: rendererPart.activeFile,
+        editorContent: rendererPart.editorContent,
+        editorDiskBaseline: rendererPart.editorDiskBaseline,
+        fileBuffers: rendererPart.fileBuffers
+      }
+      await saveSessionSnapshot(getUserData(), full)
+    }
+  )
 
   ipcMain.handle('novel:getWorkspace', async () => {
     if (!project.workspacePath || !project.currentBranchId) return null
     return {
       path: project.workspacePath,
       currentBranchId: project.currentBranchId,
-      currentNodeId: version.getBranchTip(project.currentBranchId)
+      currentNodeId: version.getBranchTip(project.currentBranchId),
+      pendingForkBeforeNextCommit: project.pendingForkBeforeNextCommit,
+      historyViewActive: project.conversationViewMaxSeq != null
     }
   })
 
@@ -109,6 +282,7 @@ export function registerIpc(
     project.setCurrentBranch(branchId)
     project.conversationViewMaxSeq = null
     project.restoredBaseNodeId = null
+    project.pendingForkBeforeNextCommit = false
     return tip
   })
 
@@ -158,6 +332,9 @@ export function registerIpc(
       if (!project.workspacePath || !project.currentBranchId) {
         throw new Error('No workspace or branch')
       }
+      if (project.pendingForkBeforeNextCommit) {
+        throw new Error('NEXT_COMMIT_REQUIRES_NEW_BRANCH_NAME')
+      }
       const cut = memory.maxSeq(project.currentBranchId)
       const parent = project.restoredBaseNodeId
       const res = await version.createCheckpoint(
@@ -172,6 +349,63 @@ export function registerIpc(
   )
 
   ipcMain.handle(
+    'novel:checkpointWithNewBranch',
+    async (
+      _e,
+      payload: { newBranchName: string; label: string }
+    ): Promise<{ nodeId: string }> => {
+      if (!project.workspacePath || !project.currentBranchId) {
+        throw new Error('No workspace or branch')
+      }
+      if (!project.pendingForkBeforeNextCommit || !project.restoredBaseNodeId) {
+        throw new Error('No pending fork for this commit')
+      }
+      const name = payload.newBranchName.trim()
+      if (!name) throw new Error('Branch name required')
+      const baseNodeId = project.restoredBaseNodeId
+      const curBranch = project.currentBranchId
+      const { conversationCutSeq: msgCut } = version.getNode(baseNodeId)
+      const { branchId: newBranchId } = version.forkBranch(baseNodeId, name)
+      memory.copyMessagesForFork(curBranch, newBranchId, msgCut)
+      project.setCurrentBranch(newBranchId)
+      project.conversationViewMaxSeq = null
+      project.pendingForkBeforeNextCommit = false
+      project.restoredBaseNodeId = null
+      const cut = memory.maxSeq(newBranchId)
+      return version.createCheckpoint(
+        newBranchId,
+        payload.label.trim() || 'Checkpoint',
+        cut,
+        null
+      )
+    }
+  )
+
+  ipcMain.handle(
+    'novel:forkAfterJump',
+    async (_e, newBranchName: string): Promise<{ branchId: string }> => {
+      if (!project.workspacePath || !project.currentBranchId) {
+        throw new Error('No workspace or branch')
+      }
+      if (!project.pendingForkBeforeNextCommit || !project.restoredBaseNodeId) {
+        throw new Error('No pending fork')
+      }
+      const baseNodeId = project.restoredBaseNodeId
+      const curBranch = project.currentBranchId
+      const { conversationCutSeq: msgCut } = version.getNode(baseNodeId)
+      const name = newBranchName.trim()
+      if (!name) throw new Error('Branch name required')
+      const { branchId: newBranchId } = version.forkBranch(baseNodeId, name)
+      memory.copyMessagesForFork(curBranch, newBranchId, msgCut)
+      project.setCurrentBranch(newBranchId)
+      project.conversationViewMaxSeq = null
+      project.pendingForkBeforeNextCommit = false
+      project.restoredBaseNodeId = null
+      return { branchId: newBranchId }
+    }
+  )
+
+  ipcMain.handle(
     'novel:forkBranch',
     async (_e, fromNodeId: string, name: string) => {
       const { branchId, sourceBranchId, conversationCutSeq } =
@@ -181,6 +415,7 @@ export function registerIpc(
       project.conversationViewMaxSeq = null
       await version.restoreWorkingTreeToNode(version.getBranchTip(branchId))
       project.restoredBaseNodeId = null
+      project.pendingForkBeforeNextCommit = false
       return { branchId }
     }
   )
@@ -191,11 +426,41 @@ export function registerIpc(
     project.setCurrentBranch(node.branchId)
     project.conversationViewMaxSeq = node.conversationCutSeq
     project.restoredBaseNodeId = nodeId
+    project.pendingForkBeforeNextCommit = version.nodeHasChild(nodeId)
     return {
       conversationCutSeq: node.conversationCutSeq,
       branchId: node.branchId
     }
   })
+
+  ipcMain.handle(
+    'novel:deleteVersionNode',
+    async (_e, nodeId: string): Promise<{ deletedIds: string[] }> => {
+      const { deletedIds } = version.deleteNodeAndDescendants(nodeId)
+      trimMemoryToVersionTips(memory, version)
+      const pruned = version.pruneBranchesWithoutOwnedNodes('main')
+      for (const bid of pruned) {
+        memory.clearBranch(bid)
+      }
+      if (
+        project.restoredBaseNodeId &&
+        deletedIds.includes(project.restoredBaseNodeId)
+      ) {
+        project.restoredBaseNodeId = null
+        project.pendingForkBeforeNextCommit = false
+      }
+      const cur = project.currentBranchId
+      if (cur && pruned.includes(cur)) {
+        const { id: mainId, tipNodeId } = resolveMainBranchRecord(version)
+        await version.restoreWorkingTreeToNode(tipNodeId)
+        project.setCurrentBranch(mainId)
+        project.conversationViewMaxSeq = null
+        project.restoredBaseNodeId = null
+        project.pendingForkBeforeNextCommit = false
+      }
+      return { deletedIds }
+    }
+  )
 
   ipcMain.handle('novel:clearHistoryView', async () => {
     project.conversationViewMaxSeq = null
@@ -206,7 +471,11 @@ export function registerIpc(
     if (!project.workspacePath || !project.currentBranchId) {
       return { dirty: false, currentBranchId: '', tipNodeId: '' }
     }
-    const dirty = await version.isDirty(project.currentBranchId)
+    const baseline = baselineNodeIdForWorkspaceDirty(project, version)
+    const dirty =
+      baseline != null
+        ? await version.isWorkspaceDirtyAgainstNode(baseline)
+        : false
     return {
       dirty,
       currentBranchId: project.currentBranchId,
@@ -242,12 +511,22 @@ export function registerIpc(
         notifyChatError(reply, 'Open a workspace first.')
         return
       }
+      if (project.pendingForkBeforeNextCommit) {
+        notifyChatError(
+          reply,
+          '该历史节点之后仍有版本：请先在界面中新建分支，再发送消息。'
+        )
+        return
+      }
       const { text, filePath } = payload
       const settings = project.settings
       if (!settings.openAiApiKey) {
         notifyChatError(reply, 'Set API key in Settings.')
         return
       }
+
+      /* 新发送表示继续当前对话，不应再按历史截取隐藏本轮 user/assistant（否则 seq 大于旧 cut 的消息在 getMessages 中被滤掉）。 */
+      project.conversationViewMaxSeq = null
 
       let fileContext = ''
       if (filePath && project.workspacePath) {
@@ -278,59 +557,164 @@ export function registerIpc(
       )
 
       try {
-        let didPrePatchDirtySnapshot = false
+        let didPreMutateDirtySnapshot = false
+        const beforeMutatingWorkspaceOnDisk = async (): Promise<void> => {
+          await awaitEditorFlushFromRenderer(reply, 12_000)
+          if (!didPreMutateDirtySnapshot) {
+            didPreMutateDirtySnapshot = true
+            const baseline = baselineNodeIdForWorkspaceDirty(project, version)
+            if (
+              baseline != null &&
+              (await version.isWorkspaceDirtyAgainstNode(baseline))
+            ) {
+              const cut = memory.maxSeq(project.currentBranchId)
+              await version.recordSnapshot(
+                project.currentBranchId,
+                'user',
+                cut,
+                'AI写入前自动保存',
+                project.restoredBaseNodeId
+              )
+              if (!project.pendingForkBeforeNextCommit) {
+                project.restoredBaseNodeId = null
+              }
+            }
+          }
+        }
+
         const executeTool = async (
           name: string,
           args: Record<string, unknown>
         ): Promise<string> => {
-          if (name !== 'patch_workspace_file') {
-            return JSON.stringify({
-              ok: false,
-              error: `Unknown tool: ${name}`
-            })
+          const ws = project.workspacePath
+          if (!ws) {
+            return JSON.stringify({ ok: false, error: 'No workspace' })
           }
-          const { path: rel, oldText, newText, replaceAll } =
-            pickPatchWorkspaceFields(args)
-          if (!rel || !project.workspacePath) {
-            return JSON.stringify({
-              ok: false,
-              error: 'Invalid path or workspace'
-            })
-          }
-          if (isUnderNovel(rel)) {
-            return JSON.stringify({
-              ok: false,
-              error: 'Cannot write under .novel'
-            })
-          }
+
           try {
-            /* 编辑器缓冲未落盘时 isDirty 只看磁盘；先让渲染进程落盘再预检/打补丁。 */
-            await awaitEditorFlushFromRenderer(reply, 12_000)
-            if (!didPrePatchDirtySnapshot) {
-              didPrePatchDirtySnapshot = true
-              if (await version.isDirty(project.currentBranchId)) {
-                const cut = memory.maxSeq(project.currentBranchId)
-                await version.recordSnapshot(
-                  project.currentBranchId,
-                  'user',
-                  cut,
-                  'AI写入前自动保存',
-                  project.restoredBaseNodeId
+            switch (name) {
+              case 'read_workspace_file': {
+                const picked = pickReadWorkspaceFields(args)
+                if (!picked) {
+                  return JSON.stringify({
+                    ok: false,
+                    error: 'Invalid or forbidden path'
+                  })
+                }
+                const r = await readWorkspaceFileForTool(
+                  ws,
+                  picked.path,
+                  picked.lineStart,
+                  picked.lineEnd
                 )
-                project.restoredBaseNodeId = null
+                if (!r.ok) {
+                  return JSON.stringify({ ok: false, error: r.error })
+                }
+                return JSON.stringify({
+                  ok: true,
+                  path: r.path,
+                  content: r.content,
+                  total_lines: r.total_lines,
+                  range: r.range,
+                  truncated: r.truncated ?? false
+                })
               }
+              case 'list_workspace_files': {
+                const listPicked = pickListWorkspaceFields(args)
+                if (listPicked === null) {
+                  return JSON.stringify({
+                    ok: false,
+                    error: 'Invalid or forbidden path_prefix'
+                  })
+                }
+                const { pathPrefix } = listPicked
+                const { paths, truncated } =
+                  await listWorkspaceFilesWithPrefix(ws, pathPrefix)
+                return JSON.stringify({
+                  ok: true,
+                  paths,
+                  truncated,
+                  count: paths.length
+                })
+              }
+              case 'search_workspace': {
+                const picked = pickSearchWorkspaceFields(args)
+                if (!picked) {
+                  return JSON.stringify({
+                    ok: false,
+                    error:
+                      'Invalid query (empty or too long) or forbidden path_prefix'
+                  })
+                }
+                const r = await searchWorkspaceLiteral(ws, picked.query, {
+                  pathPrefix: picked.pathPrefix,
+                  caseInsensitive: picked.caseInsensitive
+                })
+                if (!r.ok) {
+                  return JSON.stringify({ ok: false, error: r.error })
+                }
+                return JSON.stringify({
+                  ok: true,
+                  hits: r.hits,
+                  truncated: r.truncated,
+                  count: r.hits.length
+                })
+              }
+              case 'patch_workspace_file': {
+                const { path: rel, oldText, newText, replaceAll } =
+                  pickPatchWorkspaceFields(args)
+                if (!rel) {
+                  return JSON.stringify({
+                    ok: false,
+                    error: 'Invalid or forbidden path'
+                  })
+                }
+                await beforeMutatingWorkspaceOnDisk()
+                const result = await patchWorkspaceFile(
+                  ws,
+                  rel,
+                  oldText,
+                  newText,
+                  replaceAll
+                )
+                if (result.ok) {
+                  return JSON.stringify({ ok: true, path: rel })
+                }
+                return JSON.stringify({ ok: false, error: result.error })
+              }
+              case 'write_workspace_file': {
+                const picked = pickWriteWorkspaceFields(args)
+                if (!picked) {
+                  return JSON.stringify({
+                    ok: false,
+                    error: 'Invalid or forbidden path'
+                  })
+                }
+                await beforeMutatingWorkspaceOnDisk()
+                await writeWorkspaceFile(ws, picked.path, picked.content)
+                return JSON.stringify({ ok: true, path: picked.path })
+              }
+              case 'delete_workspace_file': {
+                const picked = pickDeleteWorkspaceFields(args)
+                if (!picked) {
+                  return JSON.stringify({
+                    ok: false,
+                    error: 'Invalid or forbidden path'
+                  })
+                }
+                await beforeMutatingWorkspaceOnDisk()
+                const del = await deleteWorkspaceFileIfExists(ws, picked.path)
+                if (!del.ok) {
+                  return JSON.stringify({ ok: false, error: del.error })
+                }
+                return JSON.stringify({ ok: true, path: picked.path })
+              }
+              default:
+                return JSON.stringify({
+                  ok: false,
+                  error: `Unknown tool: ${name}`
+                })
             }
-            const result = await patchWorkspaceFile(
-              project.workspacePath,
-              rel,
-              oldText,
-              newText,
-              replaceAll
-            )
-            if (result.ok) {
-              return JSON.stringify({ ok: true, path: rel })
-            }
-            return JSON.stringify({ ok: false, error: result.error })
           } catch (e) {
             return JSON.stringify({
               ok: false,
@@ -398,7 +782,9 @@ export function registerIpc(
             `tool:${uniq.join(', ')}`,
             project.restoredBaseNodeId
           )
-          project.restoredBaseNodeId = null
+          if (!project.pendingForkBeforeNextCommit) {
+            project.restoredBaseNodeId = null
+          }
         }
 
         /* Text streamed via CHAT_STREAM_EVENT (text_delta); CHAT_DONE triggers refresh. */

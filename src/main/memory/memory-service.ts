@@ -309,6 +309,24 @@ export class MemoryService {
     db.prepare(`DELETE FROM embeddings WHERE branch_id = ?`).run(branchId)
   }
 
+  /**
+   * Drop messages/summaries with seq (or up_to_seq) above the version tip’s
+   * `conversation_cut_seq` after subgraph deletes.
+   */
+  trimAfterConversationCut(branchId: string, maxSeqInclusive: number): void {
+    const db = this.requireDb()
+    const r = db
+      .prepare(`DELETE FROM messages WHERE branch_id = ? AND seq > ?`)
+      .run(branchId, maxSeqInclusive)
+    db.prepare(`DELETE FROM summaries WHERE branch_id = ? AND up_to_seq > ?`).run(
+      branchId,
+      maxSeqInclusive
+    )
+    if (r.changes > 0) {
+      db.prepare(`DELETE FROM embeddings WHERE branch_id = ?`).run(branchId)
+    }
+  }
+
   /** After new user message: optionally summarize + embed */
   async onUserMessagePersisted(
     settings: AppSettings,
@@ -426,10 +444,15 @@ export class MemoryService {
 
     const systemParts = [
       'You are an AI assistant helping the user write a novel. ' +
-        'When you need to change or create chapter/manuscript text in the workspace, you MUST call the tool `patch_workspace_file`: ' +
-        'provide path (relative to the workspace folder opened in this app), old_text (exact snippet to replace, or empty string only to create a missing file), new_text, and replace_all only when replacing every occurrence. ' +
-        'Paths are relative to that workspace root — if the user uses Git in a parent directory, Git path prefixes may differ until they open the repo root as the workspace. ' +
-        'Do not paste entire chapters in chat; reply briefly. If the user only wants discussion without changing files, respond without the tool.',
+        'Workspace tools (paths are always relative to the workspace folder opened in this app; never access `.novel`): ' +
+        '`read_workspace_file` to load file text (optionally line_start/line_end, 1-based); ' +
+        '`list_workspace_files` to discover paths (optional path_prefix); ' +
+        '`search_workspace` for literal substring search across files; ' +
+        '`patch_workspace_file` for small exact replacements (old_text must match byte-for-byte; empty old_text only to create a missing file); ' +
+        '`write_workspace_file` to replace an entire file; `delete_workspace_file` to remove one file. ' +
+        'Prefer read or search before patching so snippets match; use write only for full rewrites. ' +
+        'If the user uses Git in a parent directory, Git path prefixes may differ until they open the repo root as the workspace. ' +
+        'Do not paste entire chapters in chat; reply briefly. If the user only wants discussion without changing files, respond without tools.',
       memoryBlock && `Memory / context:\n${memoryBlock}`,
       fileBlock
     ].filter(Boolean)

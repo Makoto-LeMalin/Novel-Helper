@@ -7,14 +7,18 @@ import {
   type ReactNode
 } from 'react'
 import Editor from '@monaco-editor/react'
+import type * as Monaco from 'monaco-editor'
 import type {
   VersionGraph,
   AppSettings,
   BranchRecord,
-  NodeRecord
+  WorkspaceInfo
 } from '../../shared/ipc'
+import { VersionGraphPanel } from './VersionGraphPanel'
 import type { ChatStreamEvent, ChatTurnBlock } from '../../shared/chat-stream'
 import type { ChatMessageRow, NovelApi } from '../../shared/novel-api'
+import type { EditorViewState, FileBufferEntry } from '../../shared/session'
+import { normalizeFileBufferEntry } from '../../shared/session'
 
 type LiveTool = {
   kind: 'tool'
@@ -317,16 +321,41 @@ function normRelPath(p: string): string {
   return p.replace(/\\/g, '/').replace(/^\//, '').trim()
 }
 
+function viewFromEditor(
+  ed: Monaco.editor.IStandaloneCodeEditor | null
+): Pick<FileBufferEntry, 'scrollTop' | 'scrollLeft' | 'line' | 'column'> {
+  const pos = ed?.getPosition()
+  return {
+    scrollTop: ed?.getScrollTop() ?? 0,
+    scrollLeft: ed?.getScrollLeft() ?? 0,
+    line: pos?.lineNumber ?? 1,
+    column: pos?.column ?? 1
+  }
+}
+
+function applyEditorView(
+  ed: Monaco.editor.IStandaloneCodeEditor,
+  vs: EditorViewState
+): void {
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      ed.setScrollTop(vs.scrollTop)
+      ed.setScrollLeft(vs.scrollLeft)
+      ed.setPosition({ lineNumber: vs.line, column: vs.column })
+      ed.revealPositionInCenterIfOutsideViewport({
+        lineNumber: vs.line,
+        column: vs.column
+      })
+    })
+  })
+}
+
 function fileTreeExpandedStorageKey(wsPath: string): string {
   return `novel-filetree-expanded:${wsPath}`
 }
 
 export default function App(): React.ReactElement {
-  const [workspace, setWorkspace] = useState<{
-    path: string
-    currentBranchId: string
-    currentNodeId: string
-  } | null>(null)
+  const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null)
   const [files, setFiles] = useState<string[]>([])
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(
     () => new Set()
@@ -342,17 +371,37 @@ export default function App(): React.ReactElement {
   const [genPhase, setGenPhase] = useState<'idle' | 'model' | 'tools'>('idle')
   const [liveEntries, setLiveEntries] = useState<LiveEntry[]>([])
   const [status, setStatus] = useState('')
-  const [historyBanner, setHistoryBanner] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settings, setSettings] = useState<AppSettings | null>(null)
-  const [forkName, setForkName] = useState('')
-  const [forkNodeId, setForkNodeId] = useState<string | null>(null)
   /** Electron 下 window.prompt 不可用（恒为 null），检查点说明改用应用内对话框。 */
   const [checkpointModal, setCheckpointModal] = useState<
     { open: false } | { open: true; saveEditorFirst: boolean }
   >({ open: false })
   const [checkpointLabelInput, setCheckpointLabelInput] = useState('')
+  const [checkpointBranchInput, setCheckpointBranchInput] = useState('')
+  const [chatForkModal, setChatForkModal] = useState<{
+    open: boolean
+    defaultName: string
+  }>({ open: false, defaultName: '' })
+  const chatForkInputRef = useRef<HTMLInputElement>(null)
+  const pendingChatPayloadRef = useRef<{
+    text: string
+    filePath: string | null
+  } | null>(null)
+  const dirtyProceedRef = useRef<(() => Promise<void>) | null>(null)
+  const [dirtyConfirmModal, setDirtyConfirmModal] = useState<{
+    open: boolean
+    message: string
+  }>({ open: false, message: '' })
   const activeFileRef = useRef<string | null>(null)
+  const contentRef = useRef('')
+  const editorDiskBaselineRef = useRef('')
+  /** 切换文件时保留各文件的未保存内容与阅读位置。 */
+  const fileBuffersRef = useRef<Map<string, FileBufferEntry>>(new Map())
+  const monacoEditorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(
+    null
+  )
+  const pendingViewRestoreRef = useRef<EditorViewState | null>(null)
   /** AI patch 前主进程 invoke 落盘时读取最新编辑器状态（避免闭包陈旧）。 */
   const editorFlushRef = useRef({
     activeFile: null as string | null,
@@ -361,6 +410,10 @@ export default function App(): React.ReactElement {
   })
   /** 工作区切换后跳过下一次 expanded 持久化，避免把旧工作区的展开状态写入新 key。 */
   const skipFileTreePersistRef = useRef(false)
+  /** 关闭窗口时同步保存会话（pagehide 用 ref 取最新正文与缓冲）。 */
+  const sessionSaveRef = useRef({
+    path: null as string | null
+  })
   const [electronError, setElectronError] = useState<string | null>(() =>
     typeof window !== 'undefined' && !window.novel
       ? '未加载 Electron 预加载脚本（window.novel 不可用）。主进程可能指向了错误的 preload 路径；请重新执行 npm run dev 或 npm run build:app。'
@@ -446,6 +499,21 @@ export default function App(): React.ReactElement {
   const editorUnsavedToDisk =
     activeFile != null && content !== editorDiskBaseline
 
+  const stashActiveFileBuffer = useCallback(() => {
+    const af = activeFileRef.current
+    if (!af) return
+    fileBuffersRef.current.set(normRelPath(af), {
+      content: contentRef.current,
+      editorDiskBaseline: editorDiskBaselineRef.current,
+      ...viewFromEditor(monacoEditorRef.current)
+    })
+  }, [])
+
+  const clearFileBuffers = useCallback(() => {
+    fileBuffersRef.current.clear()
+    pendingViewRestoreRef.current = null
+  }, [])
+
   const refreshGraph = useCallback(async () => {
     if (!window.novel) return
     const g = await novelOrThrow().versionGraph()
@@ -471,8 +539,62 @@ export default function App(): React.ReactElement {
   }, [activeFile])
 
   useEffect(() => {
+    contentRef.current = content
+  }, [content])
+
+  useEffect(() => {
+    editorDiskBaselineRef.current = editorDiskBaseline
+  }, [editorDiskBaseline])
+
+  useEffect(() => {
     editorFlushRef.current = { activeFile, content, editorDiskBaseline }
   }, [activeFile, content, editorDiskBaseline])
+
+  useEffect(() => {
+    sessionSaveRef.current = {
+      path: workspace?.path ?? null
+    }
+  }, [workspace?.path])
+
+  useEffect(() => {
+    if (!window.novel) return
+    const flushSession = (): void => {
+      const s = sessionSaveRef.current
+      if (!s.path) return
+      stashActiveFileBuffer()
+      void novelOrThrow().saveSessionSnapshot({
+        activeFile: activeFileRef.current,
+        editorContent: contentRef.current,
+        editorDiskBaseline: editorDiskBaselineRef.current,
+        historyBanner: false,
+        fileBuffers: Object.fromEntries(fileBuffersRef.current.entries())
+      })
+    }
+    window.addEventListener('pagehide', flushSession)
+    return () => window.removeEventListener('pagehide', flushSession)
+  }, [stashActiveFileBuffer])
+
+  useEffect(() => {
+    if (!window.novel || !workspace?.path) return
+    const t = window.setTimeout(() => {
+      stashActiveFileBuffer()
+      void novelOrThrow().saveSessionSnapshot({
+        activeFile: activeFileRef.current,
+        editorContent: contentRef.current,
+        editorDiskBaseline: editorDiskBaselineRef.current,
+        historyBanner: false,
+        fileBuffers: Object.fromEntries(fileBuffersRef.current.entries())
+      })
+    }, 450)
+    return () => clearTimeout(t)
+  }, [
+    workspace?.path,
+    workspace?.currentBranchId,
+    activeFile,
+    content,
+    editorDiskBaseline,
+    stashActiveFileBuffer
+  ])
 
   useEffect(() => {
     if (!window.novel) return
@@ -483,6 +605,12 @@ export default function App(): React.ReactElement {
       if (!af || c === b) return
       await api.writeFile(af, c)
       setEditorDiskBaseline(c)
+      const v = viewFromEditor(monacoEditorRef.current)
+      fileBuffersRef.current.set(normRelPath(af), {
+        content: c,
+        editorDiskBaseline: c,
+        ...v
+      })
     })
     return () => {
       api.setEditorFlushHandler(null)
@@ -492,17 +620,53 @@ export default function App(): React.ReactElement {
   useEffect(() => {
     if (!window.novel) return
     const api = novelOrThrow()
-    api.getWorkspace().then((w) => {
-      if (w) {
-        setWorkspace(w)
-        refreshFiles()
-        refreshGraph()
-        refreshMessages()
-        refreshStatus()
+    void (async () => {
+      const r = await api.restoreLastSession()
+      if (r.ok) {
+        fileBuffersRef.current.clear()
+        if (r.fileBuffers) {
+          for (const [k, raw] of Object.entries(r.fileBuffers)) {
+            const ent = normalizeFileBufferEntry(raw)
+            if (ent) fileBuffersRef.current.set(normRelPath(k), ent)
+          }
+        }
+        setWorkspace(r.workspace)
+        setActiveFile(r.activeFile)
+        setContent(r.editorContent)
+        setEditorDiskBaseline(r.editorDiskBaseline)
+        let pv: EditorViewState | null = null
+        if (r.activeFile) {
+          const ent = fileBuffersRef.current.get(normRelPath(r.activeFile))
+          if (ent) {
+            pv = {
+              scrollTop: ent.scrollTop,
+              scrollLeft: ent.scrollLeft,
+              line: ent.line,
+              column: ent.column
+            }
+          }
+        }
+        if (!pv && r.editorView) pv = r.editorView
+        pendingViewRestoreRef.current = pv
+        await refreshFiles()
+        await refreshGraph()
+        await refreshMessages()
+        await refreshStatus()
+      } else {
+        const w = await api.getWorkspace()
+        if (w) {
+          setWorkspace(w)
+          refreshFiles()
+          refreshGraph()
+          refreshMessages()
+          refreshStatus()
+        }
       }
-    })
-    api.getSettings().then(setSettings)
-  }, [refreshFiles, refreshGraph, refreshMessages, refreshStatus])
+      api.getSettings().then(setSettings)
+    })()
+    /* refresh* 为稳定 useCallback；此处仅应用启动时恢复一次，避免依赖变化重复 restore。 */
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-once bootstrap
+  }, [])
 
   useEffect(() => {
     if (!window.novel) return
@@ -526,6 +690,11 @@ export default function App(): React.ReactElement {
               const t = await novelOrThrow().readFile(af)
               setContent(t)
               setEditorDiskBaseline(t)
+              fileBuffersRef.current.set(normRelPath(af), {
+                content: t,
+                editorDiskBaseline: t,
+                ...viewFromEditor(monacoEditorRef.current)
+              })
             } catch {
               setActiveFile(null)
               setContent('')
@@ -552,6 +721,11 @@ export default function App(): React.ReactElement {
           const t = await novelOrThrow().readFile(af)
           setContent(t)
           setEditorDiskBaseline(t)
+          fileBuffersRef.current.set(normRelPath(af), {
+            content: t,
+            editorDiskBaseline: t,
+            ...viewFromEditor(monacoEditorRef.current)
+          })
         } catch {
           setActiveFile(null)
           setContent('')
@@ -581,6 +755,7 @@ export default function App(): React.ReactElement {
   const openWorkspace = async (): Promise<void> => {
     const w = await novelOrThrow().selectWorkspace()
     if (!w) return
+    clearFileBuffers()
     setWorkspace(w)
     setFiles([])
     setActiveFile(null)
@@ -590,14 +765,36 @@ export default function App(): React.ReactElement {
     await refreshGraph()
     await refreshMessages()
     await refreshStatus()
-    setHistoryBanner(false)
   }
 
   const openFile = async (rel: string): Promise<void> => {
+    const nextKey = normRelPath(rel)
+    if (
+      activeFileRef.current &&
+      normRelPath(activeFileRef.current) === nextKey
+    ) {
+      return
+    }
+    stashActiveFileBuffer()
+    const cached = fileBuffersRef.current.get(nextKey)
+    if (cached) {
+      setActiveFile(rel)
+      setContent(cached.content)
+      setEditorDiskBaseline(cached.editorDiskBaseline)
+      pendingViewRestoreRef.current = {
+        scrollTop: cached.scrollTop,
+        scrollLeft: cached.scrollLeft,
+        line: cached.line,
+        column: cached.column
+      }
+      await refreshStatus()
+      return
+    }
     const text = await novelOrThrow().readFile(rel)
     setActiveFile(rel)
     setContent(text)
     setEditorDiskBaseline(text)
+    pendingViewRestoreRef.current = null
     await refreshStatus()
   }
 
@@ -605,12 +802,41 @@ export default function App(): React.ReactElement {
     if (!activeFile) return
     await novelOrThrow().writeFile(activeFile, content)
     setEditorDiskBaseline(content)
+    const v = viewFromEditor(monacoEditorRef.current)
+    fileBuffersRef.current.set(normRelPath(activeFile), {
+      content,
+      editorDiskBaseline: content,
+      ...v
+    })
     await refreshStatus()
   }, [activeFile, content, refreshStatus])
 
-  const openCheckpointModal = (saveEditorFirst: boolean): void => {
+  const openCheckpointModal = (): void => {
     setCheckpointLabelInput('')
-    setCheckpointModal({ open: true, saveEditorFirst })
+    setCheckpointBranchInput('')
+    void novelOrThrow()
+      .getWorkspace()
+      .then((w) => {
+        if (w) setWorkspace(w)
+      })
+      .catch(() => {
+        /* ignore */
+      })
+    setCheckpointModal({ open: true, saveEditorFirst: false })
+  }
+
+  const openCommitSnapshotModal = (): void => {
+    setCheckpointLabelInput('')
+    setCheckpointBranchInput('')
+    void novelOrThrow()
+      .getWorkspace()
+      .then((w) => {
+        if (w) setWorkspace(w)
+      })
+      .catch(() => {
+        /* ignore */
+      })
+    setCheckpointModal({ open: true, saveEditorFirst: true })
   }
 
   const closeCheckpointModal = (): void => {
@@ -621,13 +847,47 @@ export default function App(): React.ReactElement {
     if (!checkpointModal.open) return
     const saveEditorFirst = checkpointModal.saveEditorFirst
     const label = checkpointLabelInput.trim()
-    setCheckpointModal({ open: false })
+    const branchNameInput = checkpointBranchInput.trim()
     try {
       if (saveEditorFirst && activeFile && content !== editorDiskBaseline) {
         await novelOrThrow().writeFile(activeFile, content)
         setEditorDiskBaseline(content)
+        const v = viewFromEditor(monacoEditorRef.current)
+        fileBuffersRef.current.set(normRelPath(activeFile), {
+          content,
+          editorDiskBaseline: content,
+          ...v
+        })
       }
-      await novelOrThrow().checkpoint(label)
+      const wPre = await novelOrThrow().getWorkspace()
+      const pending = wPre?.pendingForkBeforeNextCommit ?? false
+      if (pending && !branchNameInput) {
+        alert('跳转后首次提交需要先填写新分支名称')
+        return
+      }
+      setCheckpointModal({ open: false })
+      if (pending) {
+        await novelOrThrow().checkpointWithNewBranch({
+          newBranchName: branchNameInput,
+          label: label || 'Checkpoint'
+        })
+      } else {
+        try {
+          await novelOrThrow().checkpoint(label)
+        } catch (e) {
+          if (
+            e instanceof Error &&
+            e.message === 'NEXT_COMMIT_REQUIRES_NEW_BRANCH_NAME'
+          ) {
+            alert('跳转后须使用新分支提交，请填写分支名称后重试')
+            setCheckpointModal({ open: true, saveEditorFirst })
+            const w2 = await novelOrThrow().getWorkspace()
+            if (w2) setWorkspace(w2)
+            return
+          }
+          throw e
+        }
+      }
       const w = await novelOrThrow().getWorkspace()
       if (w) setWorkspace(w)
       await refreshGraph()
@@ -641,49 +901,161 @@ export default function App(): React.ReactElement {
 
   const requestToolbarCheckpoint = (): void => {
     if (!workspace) return
-    openCheckpointModal(false)
+    openCheckpointModal()
+  }
+
+  const cancelDirtyConfirm = (): void => {
+    dirtyProceedRef.current = null
+    setDirtyConfirmModal({ open: false, message: '' })
+  }
+
+  const runDirtyConfirm = async (): Promise<void> => {
+    const fn = dirtyProceedRef.current
+    dirtyProceedRef.current = null
+    setDirtyConfirmModal({ open: false, message: '' })
+    if (fn) await fn()
   }
 
   const restoreNode = async (nodeId: string): Promise<void> => {
+    const runRestore = async (): Promise<void> => {
+      clearFileBuffers()
+      await novelOrThrow().restoreNode(nodeId)
+      const w = await novelOrThrow().getWorkspace()
+      if (w) setWorkspace(w)
+      const af = activeFileRef.current
+      if (af) {
+        try {
+          const t = await novelOrThrow().readFile(af)
+          setContent(t)
+          setEditorDiskBaseline(t)
+          pendingViewRestoreRef.current = null
+        } catch {
+          setActiveFile(null)
+          setContent('')
+          setEditorDiskBaseline('')
+        }
+      }
+      await refreshFiles()
+      await refreshGraph()
+      await refreshMessages()
+      await refreshStatus()
+    }
     const dirty = (await novelOrThrow().versionStatus()).dirty
     if (dirty) {
-      const ok = window.confirm(
-        '当前工作区与快照不一致，恢复将覆盖未快照的修改。继续？'
-      )
-      if (!ok) return
+      dirtyProceedRef.current = runRestore
+      setDirtyConfirmModal({
+        open: true,
+        message:
+          '当前工作区与当前查看节点快照不一致，恢复将覆盖未相对该快照保存的修改。继续？'
+      })
+      return
     }
-    await novelOrThrow().restoreNode(nodeId)
-    const w = await novelOrThrow().getWorkspace()
-    if (w) setWorkspace(w)
-    setHistoryBanner(true)
-    if (activeFile) {
+    await runRestore()
+  }
+
+  const deleteVersionNodeFromGraph = async (nodeId: string): Promise<void> => {
+    const runDelete = async (): Promise<void> => {
       try {
-        const t = await novelOrThrow().readFile(activeFile)
-        setContent(t)
-        setEditorDiskBaseline(t)
-      } catch {
-        setActiveFile(null)
-        setContent('')
-        setEditorDiskBaseline('')
+        await novelOrThrow().deleteVersionNode(nodeId)
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        alert(`删除失败：${msg}`)
+        return
       }
+      const w = await novelOrThrow().getWorkspace()
+      if (w) setWorkspace(w)
+      const af = activeFileRef.current
+      if (af) {
+        try {
+          const t = await novelOrThrow().readFile(af)
+          setContent(t)
+          setEditorDiskBaseline(t)
+          pendingViewRestoreRef.current = null
+        } catch {
+          setActiveFile(null)
+          setContent('')
+          setEditorDiskBaseline('')
+        }
+      }
+      await refreshFiles()
+      await refreshGraph()
+      await refreshMessages()
+      await refreshStatus()
     }
-    await refreshFiles()
-    await refreshGraph()
-    await refreshMessages()
-    await refreshStatus()
+    const dirty = (await novelOrThrow().versionStatus()).dirty
+    if (dirty) {
+      dirtyProceedRef.current = runDelete
+      setDirtyConfirmModal({
+        open: true,
+        message:
+          '当前工作区与当前查看节点快照不一致，删除后磁盘上未相对该快照保存的修改仍会保留。继续？'
+      })
+      return
+    }
+    await runDelete()
   }
 
   const clearHistoryView = async (): Promise<void> => {
     await novelOrThrow().clearHistoryView()
-    setHistoryBanner(false)
+    const w = await novelOrThrow().getWorkspace()
+    if (w) setWorkspace(w)
     await refreshMessages()
   }
 
+  const runForkThenSendChat = useCallback(async (): Promise<void> => {
+    const name = chatForkInputRef.current?.value.trim() ?? ''
+    if (!name) {
+      alert('请填写分支名称')
+      return
+    }
+    const payload = pendingChatPayloadRef.current
+    if (!payload) return
+    try {
+      await novelOrThrow().forkAfterJump(name)
+      const w = await novelOrThrow().getWorkspace()
+      if (w) setWorkspace(w)
+      await refreshMessages()
+      pendingChatPayloadRef.current = null
+      setChatForkModal({ open: false, defaultName: '' })
+      const text = payload.text
+      const filePath = payload.filePath
+      setLiveEntries([])
+      setGenPhase('model')
+      setChatBusy(true)
+      setMessages((prev) => [
+        ...prev,
+        { role: 'user', content: text, seq: -Date.now() }
+      ])
+      try {
+        await novelOrThrow().sendChat({ text, filePath })
+      } catch (sendErr) {
+        setLiveEntries([])
+        setGenPhase('idle')
+        setChatBusy(false)
+        setInput(text)
+        await refreshMessages()
+        const sm =
+          sendErr instanceof Error ? sendErr.message : String(sendErr)
+        alert(`分支已创建，但发送失败：${sm}`)
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      alert(`创建分支失败：${msg}`)
+    }
+  }, [refreshMessages])
+
+  const closeChatForkModal = (): void => {
+    const p = pendingChatPayloadRef.current
+    pendingChatPayloadRef.current = null
+    setChatForkModal({ open: false, defaultName: '' })
+    if (p) setInput(p.text)
+  }
+
   const switchBranch = async (branchId: string): Promise<void> => {
+    clearFileBuffers()
     await novelOrThrow().setBranch(branchId)
     const w = await novelOrThrow().getWorkspace()
     if (w) setWorkspace(w)
-    setHistoryBanner(false)
     await novelOrThrow().clearHistoryView()
     if (activeFile) {
       try {
@@ -707,6 +1079,16 @@ export default function App(): React.ReactElement {
   const sendChat = async (): Promise<void> => {
     const text = input.trim()
     if (!text || chatBusy) return
+    const w = await novelOrThrow().getWorkspace()
+    if (w?.pendingForkBeforeNextCommit) {
+      pendingChatPayloadRef.current = { text, filePath: activeFile }
+      setChatForkModal({
+        open: true,
+        defaultName: `branch-${Date.now()}`
+      })
+      setInput('')
+      return
+    }
     setInput('')
     setLiveEntries([])
     setGenPhase('model')
@@ -734,7 +1116,7 @@ export default function App(): React.ReactElement {
    */
   const requestCommitWorkspaceSnapshot = (): void => {
     if (!workspace) return
-    openCheckpointModal(true)
+    openCommitSnapshotModal()
   }
 
   useEffect(() => {
@@ -747,6 +1129,16 @@ export default function App(): React.ReactElement {
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
   }, [activeFile, workspace, saveFile])
+
+  useEffect(() => {
+    if (!activeFile) return
+    const vs = pendingViewRestoreRef.current
+    if (!vs) return
+    const ed = monacoEditorRef.current
+    if (!ed) return
+    pendingViewRestoreRef.current = null
+    applyEditorView(ed, vs)
+  }, [activeFile, content])
 
   const saveSettingsForm = async (e: React.FormEvent<HTMLFormElement>): Promise<void> => {
     e.preventDefault()
@@ -763,18 +1155,6 @@ export default function App(): React.ReactElement {
     })
     setSettings(next)
     setSettingsOpen(false)
-  }
-
-  const confirmFork = async (): Promise<void> => {
-    if (!forkNodeId || !forkName.trim()) return
-    await novelOrThrow().forkBranch(forkNodeId, forkName.trim())
-    setForkNodeId(null)
-    setForkName('')
-    const w = await novelOrThrow().getWorkspace()
-    if (w) setWorkspace(w)
-    await refreshGraph()
-    await refreshMessages()
-    await refreshStatus()
   }
 
   const branchName = (id: string): string =>
@@ -800,14 +1180,6 @@ export default function App(): React.ReactElement {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      {historyBanner ? (
-        <div className="banner">
-          正在按历史节点查看对话（已恢复该时刻文件）。{' '}
-          <button type="button" onClick={() => void clearHistoryView()}>
-            恢复显示当前分支全部消息
-          </button>
-        </div>
-      ) : null}
       <div className="app-shell">
       <header className="app-toolbar">
         <button type="button" onClick={() => void openWorkspace()}>
@@ -835,6 +1207,9 @@ export default function App(): React.ReactElement {
           {workspace
             ? `${workspace.path} · 分支 ${branchName(workspace.currentBranchId)}`
             : '未打开工作区'}
+          {workspace?.pendingForkBeforeNextCommit
+            ? ' · 该节点后有版本：对话/提交前须新建分支'
+            : ''}
           {status ? ` · ${status}` : ''}
           {editorUnsavedToDisk ? ' · 编辑器未写入磁盘' : ''}
         </span>
@@ -865,35 +1240,18 @@ export default function App(): React.ReactElement {
             </li>
           ))}
         </ul>
-        <h3>版本节点</h3>
-        <div>
-          {graph?.nodes
-            .slice()
-            .sort((a: NodeRecord, b: NodeRecord) => b.createdAt - a.createdAt)
-            .map((n: NodeRecord) => (
-              <div key={n.id} className="graph-node">
-                <div>{n.label}</div>
-                <div className="meta">
-                  {branchName(n.branchId)} ·{' '}
-                  {new Date(n.createdAt).toLocaleString()}
-                </div>
-                <div className="actions-row">
-                  <button type="button" onClick={() => void restoreNode(n.id)}>
-                    跳转（恢复文件+对话视图）
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setForkNodeId(n.id)
-                      setForkName(`fork-${Date.now()}`)
-                    }}
-                  >
-                    从此分叉
-                  </button>
-                </div>
-              </div>
-            ))}
-        </div>
+        <h3>版本图</h3>
+        {graph && workspace ? (
+          <VersionGraphPanel
+            graph={graph}
+            currentNodeId={workspace.currentNodeId}
+            branchName={branchName}
+            onJump={(id) => void restoreNode(id)}
+            onDelete={(id) => void deleteVersionNodeFromGraph(id)}
+          />
+        ) : (
+          <p className="sidebar-empty">（无数据）</p>
+        )}
       </aside>
 
       <main className="editor-area">
@@ -906,6 +1264,14 @@ export default function App(): React.ReactElement {
             defaultLanguage="markdown"
             value={content}
             onChange={(v) => setContent(v ?? '')}
+            onMount={(ed) => {
+              monacoEditorRef.current = ed
+              const vs = pendingViewRestoreRef.current
+              if (vs) {
+                pendingViewRestoreRef.current = null
+                applyEditorView(ed, vs)
+              }
+            }}
             options={{
               minimap: { enabled: false },
               wordWrap: 'on',
@@ -974,8 +1340,49 @@ export default function App(): React.ReactElement {
           >
             保存并提交快照
           </button>
+          {workspace?.historyViewActive ? (
+            <p className="chat-history-hint">
+              对话列表已对齐到跳转节点的截取位置。{' '}
+              <button type="button" onClick={() => void clearHistoryView()}>
+                显示本分支全部消息
+              </button>
+            </p>
+          ) : null}
         </div>
       </section>
+
+      {dirtyConfirmModal.open ? (
+        <div
+          className="modal-backdrop modal-backdrop-priority"
+          role="presentation"
+          onClick={() => cancelDirtyConfirm()}
+        >
+          <div
+            className="modal"
+            role="alertdialog"
+            aria-labelledby="dirty-confirm-title"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') cancelDirtyConfirm()
+            }}
+          >
+            <h2 id="dirty-confirm-title">工作区与快照不一致</h2>
+            <p className="modal-hint">{dirtyConfirmModal.message}</p>
+            <div className="actions">
+              <button type="button" onClick={() => cancelDirtyConfirm()}>
+                取消
+              </button>
+              <button
+                type="button"
+                className="primary"
+                onClick={() => void runDirtyConfirm()}
+              >
+                继续
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {settingsOpen && settings ? (
         <div
@@ -1069,6 +1476,24 @@ export default function App(): React.ReactElement {
                 若有未写入磁盘的当前文件编辑，将在创建节点前先保存到磁盘。
               </p>
             ) : null}
+            {workspace?.pendingForkBeforeNextCommit ? (
+              <>
+                <label htmlFor="checkpoint-branch-input">
+                  新分支名称（该节点之后仍有版本时必填；对话仅继承到该节点）
+                </label>
+                <input
+                  id="checkpoint-branch-input"
+                  value={checkpointBranchInput}
+                  onChange={(e) => setCheckpointBranchInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      void confirmCheckpointModal()
+                    }
+                  }}
+                />
+              </>
+            ) : null}
             <label htmlFor="checkpoint-label-input">说明（可选，留空则使用默认名称）</label>
             <input
               id="checkpoint-label-input"
@@ -1098,28 +1523,49 @@ export default function App(): React.ReactElement {
         </div>
       ) : null}
 
-      {forkNodeId ? (
+      {chatForkModal.open ? (
         <div
           className="modal-backdrop"
           role="presentation"
-          onClick={() => setForkNodeId(null)}
+          onClick={() => closeChatForkModal()}
         >
           <div
             className="modal"
             role="dialog"
+            aria-labelledby="chat-fork-modal-title"
             onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') closeChatForkModal()
+            }}
           >
-            <h2>新分支名称</h2>
+            <h2 id="chat-fork-modal-title">发送前新建分支</h2>
+            <p className="modal-hint">
+              当前跳转到的节点之后仍有版本记录。请先命名新分支，对话历史将只继承到该节点为止，再发送本条消息。
+            </p>
+            <label htmlFor="chat-fork-branch-input">分支名称</label>
             <input
-              value={forkName}
-              onChange={(e) => setForkName(e.target.value)}
+              key={chatForkModal.defaultName}
+              ref={chatForkInputRef}
+              id="chat-fork-branch-input"
+              defaultValue={chatForkModal.defaultName}
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  void runForkThenSendChat()
+                }
+              }}
             />
             <div className="actions">
-              <button type="button" onClick={() => setForkNodeId(null)}>
+              <button type="button" onClick={() => closeChatForkModal()}>
                 取消
               </button>
-              <button type="button" className="primary" onClick={() => void confirmFork()}>
-                创建并切换
+              <button
+                type="button"
+                className="primary"
+                onClick={() => void runForkThenSendChat()}
+              >
+                创建并发送
               </button>
             </div>
           </div>

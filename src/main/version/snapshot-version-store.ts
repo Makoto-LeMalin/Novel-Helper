@@ -204,7 +204,7 @@ export class SnapshotVersionStore {
     const db = this.requireDb()
     const rows = db
       .prepare(
-        `SELECT id, parent_id, branch_id, created_at, label FROM nodes ORDER BY created_at`
+        `SELECT id, parent_id, branch_id, created_at, label, conversation_cut_seq FROM nodes ORDER BY created_at`
       )
       .all() as {
       id: string
@@ -212,13 +212,15 @@ export class SnapshotVersionStore {
       branch_id: string
       created_at: number
       label: string
+      conversation_cut_seq: number
     }[]
     return rows.map((r) => ({
       id: r.id,
       parentId: r.parent_id,
       branchId: r.branch_id,
       createdAt: r.created_at,
-      label: r.label
+      label: r.label,
+      conversationCutSeq: r.conversation_cut_seq
     }))
   }
 
@@ -230,6 +232,15 @@ export class SnapshotVersionStore {
       if (n.parentId) edges.push({ from: n.parentId, to: n.id })
     }
     return { nodes, branches, edges }
+  }
+
+  /** True if any commit lists this node as parent (fork / continue from here). */
+  nodeHasChild(nodeId: string): boolean {
+    const db = this.requireDb()
+    const row = db
+      .prepare(`SELECT 1 AS x FROM nodes WHERE parent_id = ? LIMIT 1`)
+      .get(nodeId) as { x: number } | undefined
+    return row != null
   }
 
   private async storeBlob(content: Buffer): Promise<string> {
@@ -353,10 +364,10 @@ export class SnapshotVersionStore {
     }
   }
 
-  async isDirty(branchId: string): Promise<boolean> {
-    const ws = this.requireWs()
-    const tipId = this.getBranchTip(branchId)
-    const { manifest } = this.getNode(tipId)
+  /** Compare workspace files to a specific version node's manifest (not necessarily branch tip). */
+  async isWorkspaceDirtyAgainstNode(nodeId: string): Promise<boolean> {
+    this.requireWs()
+    const { manifest } = this.getNode(nodeId)
     const current = await this.buildManifestFromWorkspace()
     const keys = new Set([
       ...Object.keys(manifest),
@@ -366,5 +377,100 @@ export class SnapshotVersionStore {
       if (manifest[k] !== current[k]) return true
     }
     return false
+  }
+
+  async isDirty(branchId: string): Promise<boolean> {
+    const tipId = this.getBranchTip(branchId)
+    return this.isWorkspaceDirtyAgainstNode(tipId)
+  }
+
+  /**
+   * Remove `nodeId` and all descendants (children in the DAG). Repair each branch tip
+   * by walking parents until a node outside the deleted set. Cannot delete a root (parent_id IS NULL).
+   */
+  deleteNodeAndDescendants(nodeId: string): { deletedIds: string[] } {
+    const db = this.requireDb()
+    const target = this.getNode(nodeId)
+    if (target.parentId == null) {
+      throw new Error('Cannot delete the root commit')
+    }
+    const allNodes = this.listNodes()
+    const parentByChild = new Map<string, string | null>()
+    const childrenByParent = new Map<string, string[]>()
+    for (const n of allNodes) {
+      parentByChild.set(n.id, n.parentId)
+      if (n.parentId) {
+        const ch = childrenByParent.get(n.parentId) ?? []
+        ch.push(n.id)
+        childrenByParent.set(n.parentId, ch)
+      }
+    }
+    const toDelete = new Set<string>()
+    const stack = [nodeId]
+    while (stack.length > 0) {
+      const id = stack.pop()!
+      if (toDelete.has(id)) continue
+      toDelete.add(id)
+      for (const c of childrenByParent.get(id) ?? []) {
+        stack.push(c)
+      }
+    }
+    if (toDelete.size >= allNodes.length) {
+      throw new Error('Cannot delete all commits')
+    }
+    const branches = this.listBranches()
+    for (const b of branches) {
+      if (!toDelete.has(b.tipNodeId)) continue
+      let cur: string | null = b.tipNodeId
+      let survivor: string | null = null
+      while (cur) {
+        if (!toDelete.has(cur)) {
+          survivor = cur
+          break
+        }
+        cur = parentByChild.get(cur) ?? null
+      }
+      if (!survivor) {
+        throw new Error(
+          `Cannot delete: branch "${b.name}" would have no valid tip`
+        )
+      }
+      db.prepare(`UPDATE branches SET tip_node_id = ? WHERE id = ?`).run(
+        survivor,
+        b.id
+      )
+    }
+    const ids = [...toDelete]
+    const ph = ids.map(() => '?').join(',')
+    db.prepare(`DELETE FROM nodes WHERE id IN (${ph})`).run(...ids)
+    return { deletedIds: ids }
+  }
+
+  countNodesOnBranch(branchId: string): number {
+    const db = this.requireDb()
+    const row = db
+      .prepare(`SELECT COUNT(*) as c FROM nodes WHERE branch_id = ?`)
+      .get(branchId) as { c: number }
+    return row.c
+  }
+
+  /**
+   * Remove branches (except the named main, or the first branch if missing) that have
+   * no `nodes.branch_id` rows — tip only points at another branch’s commit.
+   */
+  pruneBranchesWithoutOwnedNodes(mainBranchName: string): string[] {
+    const db = this.requireDb()
+    const branches = this.listBranches()
+    if (branches.length === 0) return []
+    const main =
+      branches.find((b) => b.name === mainBranchName) ?? branches[0]
+    const removed: string[] = []
+    for (const b of branches) {
+      if (b.id === main.id) continue
+      if (this.countNodesOnBranch(b.id) > 0) continue
+      db.prepare(`DELETE FROM branches WHERE id = ?`).run(b.id)
+      removed.push(b.id)
+    }
+    return removed
   }
 }
