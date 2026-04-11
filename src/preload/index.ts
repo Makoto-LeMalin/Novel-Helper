@@ -15,7 +15,8 @@ import {
   CHAT_DONE_CHANNEL,
   CHAT_ERROR_CHANNEL,
   FLUSH_EDITOR_REQUEST_CHANNEL,
-  FLUSH_EDITOR_DONE_CHANNEL
+  FLUSH_EDITOR_DONE_CHANNEL,
+  WORKSPACE_RESTORED_CHANNEL
 } from '../shared/ipc'
 
 let editorFlushHandler: (() => Promise<void>) | null = null
@@ -48,8 +49,11 @@ const novel: NovelApi = {
   listTree: (): Promise<string[]> => ipcRenderer.invoke('novel:listTree'),
   versionGraph: (): Promise<VersionGraph> =>
     ipcRenderer.invoke('novel:versionGraph'),
-  checkpoint: (label: string): Promise<{ nodeId: string }> =>
-    ipcRenderer.invoke('novel:checkpoint', label),
+  checkpoint: (
+    label: string,
+    chatBranchId?: string | null
+  ): Promise<{ nodeId: string }> =>
+    ipcRenderer.invoke('novel:checkpoint', label, chatBranchId ?? null),
   checkpointWithNewBranch: (
     payload: { newBranchName: string; label: string }
   ): Promise<{ nodeId: string }> =>
@@ -71,14 +75,45 @@ const novel: NovelApi = {
     ipcRenderer.invoke('novel:clearHistoryView'),
   versionStatus: (): Promise<VersionStatus> =>
     ipcRenderer.invoke('novel:versionStatus'),
-  getMessages: () => ipcRenderer.invoke('novel:getMessages'),
+  getMessages: (chatBranchId?: string | null, chatThreadId?: string | null) =>
+    ipcRenderer.invoke(
+      'novel:getMessages',
+      chatBranchId ?? null,
+      chatThreadId ?? null
+    ),
   getSettings: (): Promise<AppSettings> => ipcRenderer.invoke('novel:getSettings'),
   setSettings: (partial: Partial<AppSettings>): Promise<AppSettings> =>
     ipcRenderer.invoke('novel:setSettings', partial),
   sendChat: (payload: {
     text: string
     filePath: string | null
+    chatBranchId?: string | null
+    chatThreadId?: string | null
   }): Promise<void> => ipcRenderer.invoke('novel:sendChat', payload),
+  cancelChat: (): Promise<void> => ipcRenderer.invoke('novel:cancelChat'),
+  newChatThread: (): Promise<
+    | { ok: true; branchId: string; threadId: string }
+    | { ok: false; error: string }
+  > => ipcRenderer.invoke('novel:newChatThread'),
+  getChatTabState: (chatBranchId?: string | null) =>
+    ipcRenderer.invoke('novel:getChatTabState', chatBranchId ?? null),
+  setChatThreadClosed: (
+    branchId: string,
+    threadId: string,
+    closed: boolean
+  ): Promise<{ ok: true } | { ok: false; error: 'last_open' }> =>
+    ipcRenderer.invoke('novel:setChatThreadClosed', branchId, threadId, closed),
+  updateChatThreadTitle: (
+    branchId: string,
+    threadId: string,
+    title: string
+  ): Promise<{ ok: true }> =>
+    ipcRenderer.invoke(
+      'novel:updateChatThreadTitle',
+      branchId,
+      threadId,
+      title
+    ),
   onChatChunk: (cb: (chunk: string) => void): (() => void) => {
     const fn = (_: Electron.IpcRendererEvent, chunk: string) => cb(chunk)
     ipcRenderer.on(CHAT_CHUNK_CHANNEL, fn)
@@ -98,6 +133,11 @@ const novel: NovelApi = {
     const fn = (_: Electron.IpcRendererEvent, msg: string) => cb(msg)
     ipcRenderer.on(CHAT_ERROR_CHANNEL, fn)
     return () => ipcRenderer.removeListener(CHAT_ERROR_CHANNEL, fn)
+  },
+  onWorkspaceRestored: (cb: () => void): (() => void) => {
+    const fn = () => cb()
+    ipcRenderer.on(WORKSPACE_RESTORED_CHANNEL, fn)
+    return () => ipcRenderer.removeListener(WORKSPACE_RESTORED_CHANNEL, fn)
   },
   setEditorFlushHandler: (fn: (() => Promise<void>) | null): void => {
     editorFlushHandler = fn

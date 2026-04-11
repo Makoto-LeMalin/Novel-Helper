@@ -41,9 +41,38 @@ export type ApiChatMessage =
     }
   | { role: 'tool'; tool_call_id: string; content: string }
 
-const TOOL_ROUNDS_MAX = 8
+const TOOL_ROUNDS_MAX = 16
 /** Per-request cap; hung TCP/HTTP otherwise leaves UI stuck on "…" forever. */
 const CHAT_COMPLETION_TIMEOUT_MS = 420_000
+
+/** User cancelled generation (stop button); distinct from timeout AbortError. */
+export class ChatCancelledError extends Error {
+  override readonly name = 'ChatCancelledError'
+  constructor() {
+    super('Chat cancelled')
+  }
+}
+
+/** Body reader / stream may reject with native AbortError while user signal is aborted. */
+function isAbortDueToUserCancel(
+  e: unknown,
+  userSignal: AbortSignal | null | undefined
+): boolean {
+  if (!userSignal?.aborted) return false
+  if (e instanceof ChatCancelledError) return true
+  return (
+    typeof e === 'object' &&
+    e !== null &&
+    'name' in e &&
+    (e as { name: string }).name === 'AbortError'
+  )
+}
+
+function streamFetchSignal(user: AbortSignal | null | undefined): AbortSignal {
+  const timeout = AbortSignal.timeout(CHAT_COMPLETION_TIMEOUT_MS)
+  if (!user) return timeout
+  return AbortSignal.any([user, timeout])
+}
 
 function chatMessagesToApi(msgs: ChatMessage[]): ApiChatMessage[] {
   return msgs.map((m) => ({
@@ -112,7 +141,8 @@ async function streamChatCompletionRound(
   settings: AppSettings,
   messages: ApiChatMessage[],
   roundIndex: number,
-  onStreamEvent: (e: ChatStreamEvent) => void
+  onStreamEvent: (e: ChatStreamEvent) => void,
+  cancelSignal: AbortSignal | null | undefined
 ): Promise<{
   message: {
     role: string
@@ -138,10 +168,11 @@ async function streamChatCompletionRound(
         tool_choice: 'auto',
         stream: true
       }),
-      signal: AbortSignal.timeout(CHAT_COMPLETION_TIMEOUT_MS)
+      signal: streamFetchSignal(cancelSignal ?? undefined)
     })
   } catch (e) {
     if (e instanceof Error && e.name === 'AbortError') {
+      if (cancelSignal?.aborted) throw new ChatCancelledError()
       throw new Error(
         `Chat request timed out after ${CHAT_COMPLETION_TIMEOUT_MS / 1000}s (no response from ${url}). Check network or API availability.`
       )
@@ -164,6 +195,7 @@ async function streamChatCompletionRound(
   let buffer = ''
 
   while (true) {
+    if (cancelSignal?.aborted) throw new ChatCancelledError()
     const { done, value } = await reader.read()
     if (done) break
     buffer += decoder.decode(value, { stream: true })
@@ -266,6 +298,14 @@ async function streamChatCompletionRound(
 
 export type ChatWithToolsOptions = {
   onStreamEvent?: (e: ChatStreamEvent) => void
+  signal?: AbortSignal | null
+}
+
+export type ChatToolLoopResult = {
+  assistantText: string
+  writtenPaths: string[]
+  turnBlocks: ChatTurnBlock[]
+  cancelled: boolean
 }
 
 function summarizeToolExecution(
@@ -356,25 +396,41 @@ export async function runChatWithToolLoop(
   initialMessages: ChatMessage[],
   executeTool: (name: string, args: Record<string, unknown>) => Promise<string>,
   options?: ChatWithToolsOptions
-): Promise<{
-  assistantText: string
-  writtenPaths: string[]
-  turnBlocks: ChatTurnBlock[]
-}> {
+): Promise<ChatToolLoopResult> {
   const messages: ApiChatMessage[] = chatMessagesToApi(initialMessages)
   const writtenPaths: string[] = []
   const turnBlocks: ChatTurnBlock[] = []
   const emit = (e: ChatStreamEvent) => options?.onStreamEvent?.(e)
+  const signal = options?.signal
   let assistantTextAllRounds = ''
 
+  const bailCancelled = (): ChatToolLoopResult => ({
+    assistantText: assistantTextAllRounds,
+    writtenPaths: [...new Set(writtenPaths)],
+    turnBlocks,
+    cancelled: true
+  })
+
   for (let round = 0; round < TOOL_ROUNDS_MAX; round++) {
+    if (signal?.aborted) return bailCancelled()
     emit({ type: 'generating', phase: 'model', round })
-    const { message } = await streamChatCompletionRound(
-      settings,
-      messages,
-      round,
-      emit
-    )
+    let message: {
+      role: string
+      content: string | null
+      tool_calls?: ToolCall[]
+    }
+    try {
+      ;({ message } = await streamChatCompletionRound(
+        settings,
+        messages,
+        round,
+        emit,
+        signal
+      ))
+    } catch (e) {
+      if (isAbortDueToUserCancel(e, signal)) return bailCancelled()
+      throw e
+    }
     const toolCalls = message.tool_calls
 
     if (toolCalls?.length) {
@@ -390,6 +446,7 @@ export async function runChatWithToolLoop(
       })
       emit({ type: 'generating', phase: 'tools', round })
       for (const tc of toolCalls) {
+        if (signal?.aborted) return bailCancelled()
         let args: Record<string, unknown> = {}
         if (tc.function.name === 'patch_workspace_file') {
           const salvaged = parsePatchWorkspaceFileArgs(tc.function.arguments)
@@ -468,6 +525,7 @@ export async function runChatWithToolLoop(
           tool_call_id: tc.id,
           content: toolContent
         })
+        if (signal?.aborted) return bailCancelled()
       }
       continue
     }
@@ -477,7 +535,12 @@ export async function runChatWithToolLoop(
     if (text.trim()) {
       turnBlocks.push({ kind: 'text', text })
     }
-    return { assistantText: assistantTextAllRounds, writtenPaths, turnBlocks }
+    return {
+      assistantText: assistantTextAllRounds,
+      writtenPaths: [...new Set(writtenPaths)],
+      turnBlocks,
+      cancelled: false
+    }
   }
 
   const uniq = [...new Set(writtenPaths)]
@@ -487,7 +550,12 @@ export async function runChatWithToolLoop(
       : '（工具调用轮次已达上限。）'
   emit({ type: 'text_delta', text: limitMsg })
   turnBlocks.push({ kind: 'text', text: limitMsg })
-  return { assistantText: limitMsg, writtenPaths: uniq, turnBlocks }
+  return {
+    assistantText: limitMsg,
+    writtenPaths: uniq,
+    turnBlocks,
+    cancelled: false
+  }
 }
 
 function normalizeBaseUrl(base: string): string {

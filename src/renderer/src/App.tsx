@@ -16,9 +16,34 @@ import type {
 } from '../../shared/ipc'
 import { VersionGraphPanel } from './VersionGraphPanel'
 import type { ChatStreamEvent, ChatTurnBlock } from '../../shared/chat-stream'
-import type { ChatMessageRow, NovelApi } from '../../shared/novel-api'
+import type {
+  ChatMessageRow,
+  ChatThreadTabInfo,
+  NovelApi
+} from '../../shared/novel-api'
 import type { EditorViewState, FileBufferEntry } from '../../shared/session'
 import { normalizeFileBufferEntry } from '../../shared/session'
+import {
+  DEFAULT_CHAT_THREAD_ID,
+  suggestChatTabTitleFromUserText
+} from '../../shared/chat-thread'
+
+type ChatTab = {
+  id: string
+  branchId: string
+  threadId: string
+  title: string
+  /** 尚未根据首轮用户消息定标题（仅「新建对话」标签）。 */
+  titlePending?: boolean
+  /** 尚未写入首条消息：仅存于渲染进程，关闭即丢弃。 */
+  ephemeral?: boolean
+}
+
+function titleFromMessages(rows: ChatMessageRow[]): string {
+  const u = rows.find((m) => m.role === 'user')
+  if (!u?.content?.trim()) return '新对话'
+  return suggestChatTabTitleFromUserText(u.content)
+}
 
 type LiveTool = {
   kind: 'tool'
@@ -366,6 +391,15 @@ export default function App(): React.ReactElement {
   const [editorDiskBaseline, setEditorDiskBaseline] = useState('')
   const [graph, setGraph] = useState<VersionGraph | null>(null)
   const [messages, setMessages] = useState<ChatMessageRow[]>([])
+  const [chatTabs, setChatTabs] = useState<ChatTab[]>([])
+  const [closedChatThreads, setClosedChatThreads] = useState<ChatThreadTabInfo[]>(
+    []
+  )
+  const [activeChatTabId, setActiveChatTabId] = useState<string | null>(null)
+  const chatTabsRef = useRef<ChatTab[]>([])
+  const activeChatTabIdRef = useRef<string | null>(null)
+  /** 尚未发送首条消息的标签（按 branchId 分组），不入库。 */
+  const ephemeralDraftTabsRef = useRef<Map<string, ChatTab[]>>(new Map())
   const [input, setInput] = useState('')
   const [chatBusy, setChatBusy] = useState(false)
   const [genPhase, setGenPhase] = useState<'idle' | 'model' | 'tools'>('idle')
@@ -387,6 +421,7 @@ export default function App(): React.ReactElement {
   const pendingChatPayloadRef = useRef<{
     text: string
     filePath: string | null
+    chatThreadId: string
   } | null>(null)
   const dirtyProceedRef = useRef<(() => Promise<void>) | null>(null)
   const [dirtyConfirmModal, setDirtyConfirmModal] = useState<{
@@ -520,11 +555,91 @@ export default function App(): React.ReactElement {
     setGraph(g)
   }, [])
 
+  useEffect(() => {
+    chatTabsRef.current = chatTabs
+  }, [chatTabs])
+
+  useEffect(() => {
+    activeChatTabIdRef.current = activeChatTabId
+  }, [activeChatTabId])
+
+  const refreshMessagesForTab = useCallback(
+    async (
+      branchId: string,
+      threadId: string,
+      tabIdForTitleSync: string | null
+    ): Promise<void> => {
+      if (!window.novel) return
+      const m = await novelOrThrow().getMessages(branchId, threadId)
+      setMessages(m)
+      if (tabIdForTitleSync == null) return
+      const auto = titleFromMessages(m)
+      setChatTabs((prev) =>
+        prev.map((t) => {
+          if (t.threadId !== tabIdForTitleSync) return t
+          if (t.titlePending) {
+            if (auto !== '新对话')
+              return { ...t, title: auto, titlePending: false }
+            return t
+          }
+          if (auto !== '新对话') return { ...t, title: auto }
+          return t
+        })
+      )
+      void novelOrThrow().updateChatThreadTitle(
+        branchId,
+        tabIdForTitleSync,
+        auto
+      )
+    },
+    []
+  )
+
+  const loadChatTabsForBranch = useCallback(
+    async (
+      branchId: string,
+      preferredActiveThreadId?: string | null
+    ): Promise<void> => {
+      if (!window.novel) return
+      const st = await novelOrThrow().getChatTabState(branchId)
+      setClosedChatThreads(st.closed)
+      const serverTabs: ChatTab[] = st.open.map((o) => ({
+        id: o.threadId,
+        branchId: st.branchId,
+        threadId: o.threadId,
+        title: o.title,
+        titlePending: o.title === '新对话'
+      }))
+      const sidSet = new Set(serverTabs.map((s) => s.threadId))
+      const extra = (ephemeralDraftTabsRef.current.get(branchId) ?? []).filter(
+        (e) => !sidSet.has(e.threadId)
+      )
+      ephemeralDraftTabsRef.current.set(branchId, extra)
+      const tabs = [...serverTabs, ...extra]
+      setChatTabs(tabs)
+      const pref = preferredActiveThreadId ?? null
+      const active =
+        pref && tabs.some((x) => x.threadId === pref)
+          ? pref
+          : tabs[0]?.threadId ?? null
+      setActiveChatTabId(active)
+      if (active) {
+        await refreshMessagesForTab(st.branchId, active, active)
+      } else {
+        setMessages([])
+      }
+    },
+    [refreshMessagesForTab]
+  )
+
   const refreshMessages = useCallback(async () => {
     if (!window.novel) return
-    const m = await novelOrThrow().getMessages()
-    setMessages(m)
-  }, [])
+    const tabs = chatTabsRef.current
+    const aid = activeChatTabIdRef.current
+    const t = tabs.find((x) => x.id === aid) ?? tabs[0]
+    if (!t) return
+    await refreshMessagesForTab(t.branchId, t.threadId, t.id)
+  }, [refreshMessagesForTab])
 
   const refreshStatus = useCallback(async () => {
     if (!window.novel) return
@@ -631,6 +746,8 @@ export default function App(): React.ReactElement {
           }
         }
         setWorkspace(r.workspace)
+        ephemeralDraftTabsRef.current.clear()
+        await loadChatTabsForBranch(r.workspace.currentBranchId)
         setActiveFile(r.activeFile)
         setContent(r.editorContent)
         setEditorDiskBaseline(r.editorDiskBaseline)
@@ -650,15 +767,15 @@ export default function App(): React.ReactElement {
         pendingViewRestoreRef.current = pv
         await refreshFiles()
         await refreshGraph()
-        await refreshMessages()
         await refreshStatus()
       } else {
         const w = await api.getWorkspace()
         if (w) {
           setWorkspace(w)
+          ephemeralDraftTabsRef.current.clear()
           refreshFiles()
           refreshGraph()
-          refreshMessages()
+          void loadChatTabsForBranch(w.currentBranchId)
           refreshStatus()
         }
       }
@@ -710,11 +827,17 @@ export default function App(): React.ReactElement {
       setGenPhase('idle')
       setChatBusy(false)
       await refreshMessages()
+      const w = await novelOrThrow().getWorkspace()
+      if (w) {
+        setWorkspace(w)
+        await loadChatTabsForBranch(
+          w.currentBranchId,
+          activeChatTabIdRef.current
+        )
+      }
       await refreshFiles()
       await refreshGraph()
       await refreshStatus()
-      const w = await novelOrThrow().getWorkspace()
-      if (w) setWorkspace(w)
       const af = activeFileRef.current
       if (af) {
         try {
@@ -740,30 +863,61 @@ export default function App(): React.ReactElement {
       /* 错误弹窗由主进程 dialog.showMessageBox 负责；此处只恢复 UI */
       console.error('[novel chat error]', e)
     })
+    const u4 = api.onWorkspaceRestored(async () => {
+      await refreshGraph()
+      await refreshStatus()
+      const w = await novelOrThrow().getWorkspace()
+      if (w) {
+        setWorkspace(w)
+        ephemeralDraftTabsRef.current.clear()
+        await loadChatTabsForBranch(w.currentBranchId)
+      }
+      const af = activeFileRef.current
+      if (af) {
+        try {
+          const t = await novelOrThrow().readFile(af)
+          setContent(t)
+          setEditorDiskBaseline(t)
+          fileBuffersRef.current.set(normRelPath(af), {
+            content: t,
+            editorDiskBaseline: t,
+            ...viewFromEditor(monacoEditorRef.current)
+          })
+        } catch {
+          setActiveFile(null)
+          setContent('')
+          setEditorDiskBaseline('')
+        }
+      }
+    })
     return () => {
       u1()
       u2()
       u3()
+      u4()
     }
   }, [
     refreshFiles,
     refreshGraph,
     refreshMessages,
-    refreshStatus
+    refreshMessagesForTab,
+    refreshStatus,
+    loadChatTabsForBranch
   ])
 
   const openWorkspace = async (): Promise<void> => {
     const w = await novelOrThrow().selectWorkspace()
     if (!w) return
     clearFileBuffers()
+    ephemeralDraftTabsRef.current.clear()
     setWorkspace(w)
+    await loadChatTabsForBranch(w.currentBranchId)
     setFiles([])
     setActiveFile(null)
     setContent('')
     setEditorDiskBaseline('')
     await refreshFiles()
     await refreshGraph()
-    await refreshMessages()
     await refreshStatus()
   }
 
@@ -873,7 +1027,10 @@ export default function App(): React.ReactElement {
         })
       } else {
         try {
-          await novelOrThrow().checkpoint(label)
+          const tabs = chatTabsRef.current
+          const aid = activeChatTabIdRef.current
+          const tab = tabs.find((x) => x.id === aid) ?? tabs[0]
+          await novelOrThrow().checkpoint(label, tab?.branchId ?? null)
         } catch (e) {
           if (
             e instanceof Error &&
@@ -921,7 +1078,11 @@ export default function App(): React.ReactElement {
       clearFileBuffers()
       await novelOrThrow().restoreNode(nodeId)
       const w = await novelOrThrow().getWorkspace()
-      if (w) setWorkspace(w)
+      if (w) {
+        setWorkspace(w)
+        ephemeralDraftTabsRef.current.clear()
+        await loadChatTabsForBranch(w.currentBranchId)
+      }
       const af = activeFileRef.current
       if (af) {
         try {
@@ -937,7 +1098,6 @@ export default function App(): React.ReactElement {
       }
       await refreshFiles()
       await refreshGraph()
-      await refreshMessages()
       await refreshStatus()
     }
     const dirty = (await novelOrThrow().versionStatus()).dirty
@@ -963,7 +1123,11 @@ export default function App(): React.ReactElement {
         return
       }
       const w = await novelOrThrow().getWorkspace()
-      if (w) setWorkspace(w)
+      if (w) {
+        setWorkspace(w)
+        ephemeralDraftTabsRef.current.clear()
+        await loadChatTabsForBranch(w.currentBranchId)
+      }
       const af = activeFileRef.current
       if (af) {
         try {
@@ -979,7 +1143,6 @@ export default function App(): React.ReactElement {
       }
       await refreshFiles()
       await refreshGraph()
-      await refreshMessages()
       await refreshStatus()
     }
     const dirty = (await novelOrThrow().versionStatus()).dirty
@@ -1013,8 +1176,29 @@ export default function App(): React.ReactElement {
     try {
       await novelOrThrow().forkAfterJump(name)
       const w = await novelOrThrow().getWorkspace()
-      if (w) setWorkspace(w)
-      await refreshMessages()
+      if (!w) {
+        alert('分支已创建，但无法读取工作区，请重试发送。')
+        return
+      }
+      setWorkspace(w)
+      ephemeralDraftTabsRef.current.clear()
+      const bid = w.currentBranchId
+      const tid = payload.chatThreadId
+      const tabState = await novelOrThrow().getChatTabState(bid)
+      const threadAlreadyOpen = tabState.open.some((o) => o.threadId === tid)
+      if (!threadAlreadyOpen) {
+        ephemeralDraftTabsRef.current.set(bid, [
+          {
+            id: tid,
+            branchId: bid,
+            threadId: tid,
+            title: '新对话（未发送）',
+            titlePending: true,
+            ephemeral: true
+          }
+        ])
+      }
+      await loadChatTabsForBranch(bid, tid)
       pendingChatPayloadRef.current = null
       setChatForkModal({ open: false, defaultName: '' })
       const text = payload.text
@@ -1022,18 +1206,52 @@ export default function App(): React.ReactElement {
       setLiveEntries([])
       setGenPhase('model')
       setChatBusy(true)
-      setMessages((prev) => [
-        ...prev,
+      const base = await novelOrThrow().getMessages(bid, tid)
+      setMessages([
+        ...base,
         { role: 'user', content: text, seq: -Date.now() }
       ])
+      const tl = suggestChatTabTitleFromUserText(text)
+      setChatTabs((prev) =>
+        prev.map((t) => {
+          if (t.threadId !== tid) return t
+          const firstTurnHere =
+            t.ephemeral === true ||
+            t.titlePending === true ||
+            t.title === '新对话' ||
+            t.title === '新对话（未发送）'
+          if (!firstTurnHere) return t
+          return {
+            ...t,
+            title: tl,
+            titlePending: false,
+            ephemeral: false
+          }
+        })
+      )
       try {
-        await novelOrThrow().sendChat({ text, filePath })
+        await novelOrThrow().sendChat({
+          text,
+          filePath,
+          chatBranchId: w.currentBranchId,
+          chatThreadId: tid
+        })
       } catch (sendErr) {
         setLiveEntries([])
         setGenPhase('idle')
         setChatBusy(false)
         setInput(text)
-        await refreshMessages()
+        if (w) {
+          const tabs = chatTabsRef.current
+          const aid = activeChatTabIdRef.current
+          const tab = tabs.find((x) => x.id === aid) ?? tabs[0]
+          if (tab)
+            await refreshMessagesForTab(
+              w.currentBranchId,
+              tab.threadId,
+              tab.id
+            )
+        }
         const sm =
           sendErr instanceof Error ? sendErr.message : String(sendErr)
         alert(`分支已创建，但发送失败：${sm}`)
@@ -1042,7 +1260,7 @@ export default function App(): React.ReactElement {
       const msg = err instanceof Error ? err.message : String(err)
       alert(`创建分支失败：${msg}`)
     }
-  }, [refreshMessages])
+  }, [refreshMessagesForTab, loadChatTabsForBranch])
 
   const closeChatForkModal = (): void => {
     const p = pendingChatPayloadRef.current
@@ -1056,7 +1274,9 @@ export default function App(): React.ReactElement {
     await novelOrThrow().setBranch(branchId)
     const w = await novelOrThrow().getWorkspace()
     if (w) setWorkspace(w)
+    ephemeralDraftTabsRef.current.clear()
     await novelOrThrow().clearHistoryView()
+    await loadChatTabsForBranch(branchId)
     if (activeFile) {
       try {
         const t = await novelOrThrow().readFile(activeFile)
@@ -1071,17 +1291,114 @@ export default function App(): React.ReactElement {
       setContent('')
       setEditorDiskBaseline('')
     }
-    await refreshMessages()
     await refreshGraph()
     await refreshStatus()
   }
+
+  const newChatTab = useCallback(async (): Promise<void> => {
+    if (!workspace) return
+    const r = await novelOrThrow().newChatThread()
+    if (!r.ok) {
+      alert(`无法新建对话：${r.error}`)
+      return
+    }
+    const tab: ChatTab = {
+      id: r.threadId,
+      branchId: r.branchId,
+      threadId: r.threadId,
+      title: '新对话（未发送）',
+      titlePending: true,
+      ephemeral: true
+    }
+    const cur = ephemeralDraftTabsRef.current.get(r.branchId) ?? []
+    ephemeralDraftTabsRef.current.set(r.branchId, [...cur, tab])
+    await loadChatTabsForBranch(r.branchId, r.threadId)
+  }, [workspace, loadChatTabsForBranch])
+
+  const reopenClosedChatThread = useCallback(
+    async (threadId: string): Promise<void> => {
+      if (!workspace) return
+      const r = await novelOrThrow().setChatThreadClosed(
+        workspace.currentBranchId,
+        threadId,
+        false
+      )
+      if (!r.ok) {
+        alert('无法重新打开该对话')
+        return
+      }
+      await loadChatTabsForBranch(workspace.currentBranchId, threadId)
+    },
+    [workspace, loadChatTabsForBranch]
+  )
+
+  const selectChatTab = useCallback(
+    (tab: ChatTab): void => {
+      if (tab.id === activeChatTabIdRef.current) return
+      setActiveChatTabId(tab.id)
+      void refreshMessagesForTab(tab.branchId, tab.threadId, tab.id)
+    },
+    [refreshMessagesForTab]
+  )
+
+  const closeChatTab = useCallback(
+    async (threadId: string, e?: React.MouseEvent): Promise<void> => {
+      e?.stopPropagation()
+      const prev = chatTabsRef.current
+      const closing = prev.find((t) => t.threadId === threadId)
+      if (!closing) return
+      if (closing.ephemeral) {
+        const cur = ephemeralDraftTabsRef.current.get(closing.branchId) ?? []
+        ephemeralDraftTabsRef.current.set(
+          closing.branchId,
+          cur.filter((t) => t.threadId !== threadId)
+        )
+        const idx = prev.findIndex((t) => t.threadId === threadId)
+        const wasActive = activeChatTabIdRef.current === threadId
+        const neighbour =
+          prev[idx + 1]?.threadId ?? prev[idx - 1]?.threadId ?? null
+        const pref = wasActive ? neighbour : activeChatTabIdRef.current
+        await loadChatTabsForBranch(closing.branchId, pref)
+        return
+      }
+      const nonEphemeral = prev.filter((t) => !t.ephemeral)
+      if (nonEphemeral.length <= 1) return
+      const r = await novelOrThrow().setChatThreadClosed(
+        closing.branchId,
+        threadId,
+        true
+      )
+      if (!r.ok) {
+        alert('至少需要保留一个打开的对话标签')
+        return
+      }
+      const idx = prev.findIndex((t) => t.threadId === threadId)
+      const wasActive = activeChatTabIdRef.current === threadId
+      const neighbour =
+        prev[idx + 1]?.threadId ?? prev[idx - 1]?.threadId ?? null
+      const pref = wasActive ? neighbour : activeChatTabIdRef.current
+      await loadChatTabsForBranch(closing.branchId, pref)
+    },
+    [loadChatTabsForBranch]
+  )
+
+  const stopChatGeneration = useCallback(async (): Promise<void> => {
+    await novelOrThrow().cancelChat()
+  }, [])
 
   const sendChat = async (): Promise<void> => {
     const text = input.trim()
     if (!text || chatBusy) return
     const w = await novelOrThrow().getWorkspace()
     if (w?.pendingForkBeforeNextCommit) {
-      pendingChatPayloadRef.current = { text, filePath: activeFile }
+      const tabs = chatTabsRef.current
+      const aid = activeChatTabIdRef.current
+      const tab = tabs.find((x) => x.id === aid) ?? tabs[0]
+      pendingChatPayloadRef.current = {
+        text,
+        filePath: activeFile,
+        chatThreadId: tab?.threadId ?? DEFAULT_CHAT_THREAD_ID
+      }
       setChatForkModal({
         open: true,
         defaultName: `branch-${Date.now()}`
@@ -1098,10 +1415,37 @@ export default function App(): React.ReactElement {
       ...prev,
       { role: 'user', content: text, seq: -Date.now() }
     ])
+    const tabs = chatTabsRef.current
+    const aid = activeChatTabIdRef.current
+    const tab = tabs.find((x) => x.id === aid) ?? tabs[0]
+    if (
+      tab &&
+      (tab.titlePending === true ||
+        tab.title === '新对话' ||
+        tab.title === '新对话（未发送）')
+    ) {
+      const nt = suggestChatTabTitleFromUserText(text)
+      setChatTabs((prev) =>
+        prev.map((t) =>
+          t.id === tab.id
+            ? { ...t, title: nt, titlePending: false, ephemeral: false }
+            : t
+        )
+      )
+      if (!tab.ephemeral) {
+        void novelOrThrow().updateChatThreadTitle(
+          tab.branchId,
+          tab.threadId,
+          nt
+        )
+      }
+    }
     try {
       await novelOrThrow().sendChat({
         text,
-        filePath: activeFile
+        filePath: activeFile,
+        chatBranchId: tab?.branchId,
+        chatThreadId: tab?.threadId ?? DEFAULT_CHAT_THREAD_ID
       })
     } catch (err) {
       setLiveEntries([])
@@ -1161,6 +1505,11 @@ export default function App(): React.ReactElement {
     graph?.branches.find((b: BranchRecord) => b.id === id)?.name ??
     id.slice(0, 8)
 
+  const activeChatTab =
+    chatTabs.find((t) => t.id === activeChatTabId) ?? chatTabs[0]
+  const displayChatBranchId =
+    activeChatTab?.branchId ?? workspace?.currentBranchId ?? null
+
   if (electronError) {
     return (
       <div
@@ -1203,12 +1552,27 @@ export default function App(): React.ReactElement {
         <button type="button" onClick={() => setSettingsOpen(true)}>
           设置
         </button>
+        <button
+          type="button"
+          title="在当前版本分支上新建一条独立对话线程（不增加 DAG 分支）。若查看的历史节点之后仍有版本，首次发送或检查点前仍须「发送前新建分支」；新建空标签不受此限制。首轮发送后根据首句自动生成标签标题。"
+          disabled={!workspace}
+          onClick={() => void newChatTab()}
+        >
+          新对话
+        </button>
         <span className="status">
           {workspace
-            ? `${workspace.path} · 分支 ${branchName(workspace.currentBranchId)}`
+            ? `${workspace.path} · 当前对话分支 ${branchName(
+                displayChatBranchId ?? workspace.currentBranchId
+              )}${
+                workspace.workspaceBranchId &&
+                workspace.workspaceBranchId !== workspace.currentBranchId
+                  ? ` · 磁盘 ${branchName(workspace.workspaceBranchId)}`
+                  : ''
+              }`
             : '未打开工作区'}
           {workspace?.pendingForkBeforeNextCommit
-            ? ' · 该节点后有版本：对话/提交前须新建分支'
+            ? ' · 该节点后有版本：发送或提交前须新建分支'
             : ''}
           {status ? ` · ${status}` : ''}
           {editorUnsavedToDisk ? ' · 编辑器未写入磁盘' : ''}
@@ -1283,10 +1647,66 @@ export default function App(): React.ReactElement {
 
       <section className="chat-panel">
         <h3>AI 对话</h3>
+        {workspace && chatTabs.length > 0 ? (
+          <div className="chat-tabs" role="tablist" aria-label="对话标签">
+            {chatTabs.map((tab) => (
+              <div
+                key={tab.id}
+                role="tab"
+                aria-selected={tab.id === activeChatTabId}
+                className={`chat-tab ${
+                  tab.id === activeChatTabId ? 'active' : ''
+                }`}
+                onClick={() => selectChatTab(tab)}
+                title={tab.title}
+              >
+                <span className="chat-tab-title">{tab.title}</span>
+                <button
+                  type="button"
+                  className="chat-tab-close"
+                  title="关闭此对话（可从下方「已关闭」再次打开）"
+                  aria-label={`关闭 ${tab.title}`}
+                  onClick={(e) => void closeChatTab(tab.threadId, e)}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {workspace && closedChatThreads.length > 0 ? (
+          <div className="chat-closed-picker">
+            <span className="chat-closed-label">已关闭</span>
+            <select
+              aria-label="打开已关闭的对话"
+              defaultValue=""
+              onChange={(ev) => {
+                const v = ev.target.value
+                if (v) void reopenClosedChatThread(v)
+                ev.target.selectedIndex = 0
+              }}
+            >
+              <option value="">打开已关闭对话…</option>
+              {closedChatThreads.map((c) => (
+                <option key={c.threadId} value={c.threadId}>
+                  {c.title}
+                </option>
+              ))}
+            </select>
+          </div>
+        ) : null}
         {chatBusy ? (
           <div className="chat-generating-bar" role="status">
             <span className="chat-generating-dot" aria-hidden />
             {genPhase === 'tools' ? '正在执行工具…' : '模型生成中…'}
+            <button
+              type="button"
+              className="chat-stop-btn"
+              title="停止后续输出；已落盘的工具写入保留，且不会创建本轮 AI 快照"
+              onClick={() => void stopChatGeneration()}
+            >
+              停止生成
+            </button>
           </div>
         ) : null}
         <div className="chat-messages">

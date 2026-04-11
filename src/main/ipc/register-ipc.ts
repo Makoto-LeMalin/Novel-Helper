@@ -7,6 +7,12 @@ import { SnapshotVersionStore } from '../version/snapshot-version-store'
 import { MemoryService } from '../memory/memory-service'
 import { runChatWithToolLoop } from '../llm/openai-client'
 import {
+  clearActiveChatsOnWorkspaceChange,
+  cancelChatForWebContents,
+  clearActiveChatAbort,
+  setActiveChatAbort
+} from './window-sessions'
+import {
   pickDeleteWorkspaceFields,
   pickListWorkspaceFields,
   pickPatchWorkspaceFields,
@@ -33,6 +39,7 @@ import {
   CHAT_ERROR_CHANNEL,
   FLUSH_EDITOR_REQUEST_CHANNEL,
   FLUSH_EDITOR_DONE_CHANNEL,
+  WORKSPACE_RESTORED_CHANNEL,
   type AppSettings,
   type WorkspaceInfo
 } from '../../shared/ipc'
@@ -46,6 +53,7 @@ import {
   type ChatStreamEvent
 } from '../../shared/chat-stream'
 import { randomUUID } from 'crypto'
+import { normalizeChatThreadId } from '../../shared/chat-thread'
 
 /** 等待渲染进程将当前编辑器缓冲写入磁盘（Electron 无 ipcRenderer.handle，用 send/应答）。 */
 function awaitEditorFlushFromRenderer(
@@ -83,7 +91,9 @@ async function openWorkspaceCore(
     | 'pendingForkBeforeNextCommit'
   >
 ): Promise<WorkspaceInfo> {
+  const prevPath = project.workspacePath
   project.setWorkspace(absPath)
+  if (prevPath !== absPath) clearActiveChatsOnWorkspaceChange()
   version.open(absPath)
   memory.open(absPath)
   await version.hydrateEmptyInitialSnapshot()
@@ -95,9 +105,11 @@ async function openWorkspaceCore(
     project.restoredBaseNodeId = null
     project.pendingForkBeforeNextCommit = false
     const bid = main?.id ?? null
+    const bidStr = bid ?? ''
     return {
       path: absPath,
-      currentBranchId: bid ?? '',
+      currentBranchId: bidStr,
+      workspaceBranchId: bidStr,
       currentNodeId: bid ? version.getBranchTip(bid) : '',
       pendingForkBeforeNextCommit: false,
       historyViewActive: false
@@ -120,13 +132,40 @@ async function openWorkspaceCore(
   project.pendingForkBeforeNextCommit = project.restoredBaseNodeId
     ? version.nodeHasChild(project.restoredBaseNodeId)
     : false
+  const bidStr = bid ?? ''
   return {
     path: absPath,
-    currentBranchId: bid ?? '',
+    currentBranchId: bidStr,
+    workspaceBranchId: bidStr,
     currentNodeId: bid ? version.getBranchTip(bid) : '',
     pendingForkBeforeNextCommit: project.pendingForkBeforeNextCommit,
     historyViewActive: project.conversationViewMaxSeq != null
   }
+}
+
+function dialogParentWindow(): BrowserWindow | null {
+  return BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0] ?? null
+}
+
+function broadcastWorkspaceRestored(): void {
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (!w.isDestroyed()) w.webContents.send(WORKSPACE_RESTORED_CHANNEL)
+  }
+}
+
+/** Conversation branch for memory/chat; must be a known branch id. */
+function resolveConversationBranchId(
+  version: SnapshotVersionStore,
+  project: ProjectState,
+  requested: unknown
+): string | null {
+  const disk = project.currentBranchId
+  if (!disk) return null
+  if (typeof requested === 'string' && requested.length > 0) {
+    const ok = version.listBranches().some((b) => b.id === requested)
+    if (ok) return requested
+  }
+  return disk
 }
 
 /** 工作区脏检查基准：跳转查看某节点时与「该节点」快照比，否则与分支 tip 比。 */
@@ -135,6 +174,11 @@ function baselineNodeIdForWorkspaceDirty(
   version: SnapshotVersionStore
 ): string | null {
   if (!project.currentBranchId) return null
+  const rid = project.restoredBaseNodeId
+  if (rid != null && !version.nodeExists(rid)) {
+    project.restoredBaseNodeId = null
+    project.pendingForkBeforeNextCommit = false
+  }
   return project.restoredBaseNodeId != null
     ? project.restoredBaseNodeId
     : version.getBranchTip(project.currentBranchId)
@@ -145,6 +189,7 @@ function trimMemoryToVersionTips(
   version: SnapshotVersionStore
 ): void {
   for (const b of version.listBranches()) {
+    if (!version.nodeExists(b.tipNodeId)) continue
     const cut = version.getNode(b.tipNodeId).conversationCutSeq
     memory.trimAfterConversationCut(b.id, cut)
   }
@@ -180,11 +225,10 @@ export function registerIpc(
   project: ProjectState,
   version: SnapshotVersionStore,
   memory: MemoryService,
-  getUserData: () => string,
-  getWindow: () => BrowserWindow | null
+  getUserData: () => string
 ): void {
   ipcMain.handle('novel:selectWorkspace', async () => {
-    const win = getWindow()
+    const win = dialogParentWindow()
     /* Workspace root = all relative paths (files, AI tool `path`, tree) are under this folder.
        If this is a subfolder of a Git repo, `git status` paths are often prefixed with that
        subfolder name; opening the repository root as workspace aligns app paths with Git. */
@@ -265,10 +309,12 @@ export function registerIpc(
 
   ipcMain.handle('novel:getWorkspace', async () => {
     if (!project.workspacePath || !project.currentBranchId) return null
+    const disk = project.currentBranchId
     return {
       path: project.workspacePath,
-      currentBranchId: project.currentBranchId,
-      currentNodeId: version.getBranchTip(project.currentBranchId),
+      currentBranchId: disk,
+      workspaceBranchId: disk,
+      currentNodeId: version.getBranchTip(disk),
       pendingForkBeforeNextCommit: project.pendingForkBeforeNextCommit,
       historyViewActive: project.conversationViewMaxSeq != null
     }
@@ -283,6 +329,7 @@ export function registerIpc(
     project.conversationViewMaxSeq = null
     project.restoredBaseNodeId = null
     project.pendingForkBeforeNextCommit = false
+    broadcastWorkspaceRestored()
     return tip
   })
 
@@ -328,17 +375,23 @@ export function registerIpc(
 
   ipcMain.handle(
     'novel:checkpoint',
-    async (_e, label: string) => {
+    async (_e, label: string, chatBranchId?: string | null) => {
       if (!project.workspacePath || !project.currentBranchId) {
         throw new Error('No workspace or branch')
       }
       if (project.pendingForkBeforeNextCommit) {
         throw new Error('NEXT_COMMIT_REQUIRES_NEW_BRANCH_NAME')
       }
-      const cut = memory.maxSeq(project.currentBranchId)
+      const chatBranch = resolveConversationBranchId(
+        version,
+        project,
+        chatBranchId
+      )
+      if (!chatBranch) throw new Error('No branch')
+      const cut = memory.maxSeq(chatBranch)
       const parent = project.restoredBaseNodeId
       const res = await version.createCheckpoint(
-        project.currentBranchId,
+        chatBranch,
         label || 'Checkpoint',
         cut,
         parent
@@ -416,6 +469,7 @@ export function registerIpc(
       await version.restoreWorkingTreeToNode(version.getBranchTip(branchId))
       project.restoredBaseNodeId = null
       project.pendingForkBeforeNextCommit = false
+      broadcastWorkspaceRestored()
       return { branchId }
     }
   )
@@ -427,6 +481,7 @@ export function registerIpc(
     project.conversationViewMaxSeq = node.conversationCutSeq
     project.restoredBaseNodeId = nodeId
     project.pendingForkBeforeNextCommit = version.nodeHasChild(nodeId)
+    broadcastWorkspaceRestored()
     return {
       conversationCutSeq: node.conversationCutSeq,
       branchId: node.branchId
@@ -457,6 +512,7 @@ export function registerIpc(
         project.conversationViewMaxSeq = null
         project.restoredBaseNodeId = null
         project.pendingForkBeforeNextCommit = false
+        broadcastWorkspaceRestored()
       }
       return { deletedIds }
     }
@@ -483,14 +539,19 @@ export function registerIpc(
     }
   })
 
-  ipcMain.handle('novel:getMessages', async () => {
-    if (!project.currentBranchId) throw new Error('No branch')
-    const maxSeq = project.conversationViewMaxSeq
-    if (maxSeq != null) {
-      return memory.getMessagesUpToSeq(project.currentBranchId, maxSeq)
+  ipcMain.handle(
+    'novel:getMessages',
+    async (_e, chatBranchId?: string | null, chatThreadId?: string | null) => {
+      const bid = resolveConversationBranchId(version, project, chatBranchId)
+      if (!bid) throw new Error('No branch')
+      const tid = normalizeChatThreadId(chatThreadId)
+      const maxSeq = project.conversationViewMaxSeq
+      if (maxSeq != null) {
+        return memory.getMessagesUpToSeq(bid, maxSeq, tid)
+      }
+      return memory.getRecentMessages(bid, tid, 8000)
     }
-    return memory.getRecentMessages(project.currentBranchId, 8000)
-  })
+  )
 
   ipcMain.handle('novel:getSettings', async () => project.settings)
 
@@ -505,7 +566,15 @@ export function registerIpc(
 
   ipcMain.handle(
     'novel:sendChat',
-    async (event, payload: { text: string; filePath: string | null }) => {
+    async (
+      event,
+      payload: {
+        text: string
+        filePath: string | null
+        chatBranchId?: string | null
+        chatThreadId?: string | null
+      }
+    ) => {
       const reply = event.sender
       if (!project.workspacePath || !project.currentBranchId) {
         notifyChatError(reply, 'Open a workspace first.')
@@ -518,7 +587,13 @@ export function registerIpc(
         )
         return
       }
-      const { text, filePath } = payload
+      const {
+        text,
+        filePath,
+        chatBranchId: requestedBranch,
+        chatThreadId: requestedThread
+      } = payload
+      const chatThreadId = normalizeChatThreadId(requestedThread)
       const settings = project.settings
       if (!settings.openAiApiKey) {
         notifyChatError(reply, 'Set API key in Settings.')
@@ -544,18 +619,43 @@ export function registerIpc(
         }
       }
 
+      const chatBranchId = resolveConversationBranchId(
+        version,
+        project,
+        requestedBranch
+      )
+      if (!chatBranchId) {
+        notifyChatError(reply, 'Invalid conversation branch.')
+        return
+      }
+
+      memory.ensureChatThreadForFirstUserMessage(
+        chatBranchId,
+        chatThreadId,
+        text
+      )
+
       const userId = randomUUID()
-      memory.appendMessage(project.currentBranchId, 'user', text, userId)
-      await memory.onUserMessagePersisted(settings, project.currentBranchId, text)
+      memory.appendMessage(chatBranchId, chatThreadId, 'user', text, userId)
+      await memory.onUserMessagePersisted(
+        settings,
+        chatBranchId,
+        chatThreadId,
+        text
+      )
 
       const messages = await memory.buildAugmentedMessages(
         settings,
-        project.currentBranchId,
+        chatBranchId,
+        chatThreadId,
         filePath,
         fileContext,
         text
       )
 
+      const wcId = reply.id
+      const ac = new AbortController()
+      setActiveChatAbort(wcId, ac)
       try {
         let didPreMutateDirtySnapshot = false
         const beforeMutatingWorkspaceOnDisk = async (): Promise<void> => {
@@ -567,9 +667,9 @@ export function registerIpc(
               baseline != null &&
               (await version.isWorkspaceDirtyAgainstNode(baseline))
             ) {
-              const cut = memory.maxSeq(project.currentBranchId)
+              const cut = memory.maxSeq(chatBranchId)
               await version.recordSnapshot(
-                project.currentBranchId,
+                chatBranchId,
                 'user',
                 cut,
                 'AI写入前自动保存',
@@ -726,9 +826,10 @@ export function registerIpc(
         const sendStream = (ev: ChatStreamEvent) =>
           reply.send(CHAT_STREAM_EVENT_CHANNEL, ev)
 
-        const { assistantText, writtenPaths, turnBlocks } =
+        const { assistantText, writtenPaths, turnBlocks, cancelled } =
           await runChatWithToolLoop(settings, messages, executeTool, {
-            onStreamEvent: sendStream
+            onStreamEvent: sendStream,
+            signal: ac.signal
           })
 
         const uniq = [...new Set(writtenPaths)]
@@ -739,7 +840,9 @@ export function registerIpc(
             (full.trim() ? '\n\n' : '') +
             `[已写入工作区: ${uniq.join(', ')}]`
         }
-        if (!full.trim()) {
+        if (cancelled) {
+          full = full.trim() ? `${full}\n\n（输出已停止）` : '（输出已停止）'
+        } else if (!full.trim()) {
           full =
             uniq.length > 0
               ? `已更新文件：${uniq.join(', ')}`
@@ -766,17 +869,18 @@ export function registerIpc(
 
         const asstId = randomUUID()
         memory.appendMessage(
-          project.currentBranchId,
+          chatBranchId,
+          chatThreadId,
           'assistant',
           full,
           asstId,
           blocksForDb.length > 0 ? blocksForDb : null
         )
 
-        if (uniq.length > 0 && project.currentBranchId) {
-          const cut = memory.maxSeq(project.currentBranchId)
+        if (!cancelled && uniq.length > 0) {
+          const cut = memory.maxSeq(chatBranchId)
           await version.recordSnapshot(
-            project.currentBranchId,
+            chatBranchId,
             'ai',
             cut,
             `tool:${uniq.join(', ')}`,
@@ -792,7 +896,64 @@ export function registerIpc(
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         notifyChatError(reply, msg)
+      } finally {
+        clearActiveChatAbort(wcId)
       }
+    }
+  )
+
+  ipcMain.handle('novel:cancelChat', async (event) => {
+    cancelChatForWebContents(event.sender.id)
+  })
+
+  ipcMain.handle('novel:newChatThread', async () => {
+    if (!project.workspacePath || !project.currentBranchId) {
+      return { ok: false as const, error: 'no_workspace' }
+    }
+    /* 跳转历史节点后 pendingFork 只约束「发送 / 检查点」写 DAG，不阻止新建对话线程。 */
+    const branchId = project.currentBranchId
+    const threadId = randomUUID()
+    return {
+      ok: true as const,
+      branchId,
+      threadId
+    }
+  })
+
+  ipcMain.handle(
+    'novel:getChatTabState',
+    async (_e, chatBranchId?: string | null) => {
+      const bid = resolveConversationBranchId(version, project, chatBranchId)
+      if (!bid) throw new Error('No branch')
+      return memory.getChatTabState(bid)
+    }
+  )
+
+  ipcMain.handle(
+    'novel:setChatThreadClosed',
+    async (_e, branchId: string, threadId: string, closed: boolean) => {
+      const bid = resolveConversationBranchId(version, project, branchId)
+      if (!bid) throw new Error('No branch')
+      try {
+        memory.setChatThreadClosed(bid, threadId, !!closed)
+        return { ok: true as const }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        if (msg === 'LAST_OPEN_CHAT_THREAD') {
+          return { ok: false as const, error: 'last_open' as const }
+        }
+        throw e
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'novel:updateChatThreadTitle',
+    async (_e, branchId: string, threadId: string, title: string) => {
+      const bid = resolveConversationBranchId(version, project, branchId)
+      if (!bid) throw new Error('No branch')
+      memory.updateChatThreadTitle(bid, threadId, title)
+      return { ok: true as const }
     }
   )
 }

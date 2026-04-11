@@ -6,6 +6,7 @@ import { SnapshotVersionStore } from './version/snapshot-version-store'
 import { MemoryService } from './memory/memory-service'
 import { loadSettings } from './persistence/settings-store'
 import { registerIpc } from './ipc/register-ipc'
+import { removeChatSession } from './ipc/window-sessions'
 
 const project = new ProjectState()
 const versionStore = new SnapshotVersionStore()
@@ -13,7 +14,7 @@ const memoryService = new MemoryService()
 
 let mainWindow: BrowserWindow | null = null
 
-/** electron-vite emits preload as index.cjs when output.format is 'cjs'. */
+/** electron-vite emits preload as index.cjs when output.format is cjs. */
 function preloadScriptPath(): string {
   const dir = join(__dirname, '../preload')
   const cjs = join(dir, 'index.cjs')
@@ -23,7 +24,7 @@ function preloadScriptPath(): string {
   return cjs
 }
 
-function createWindow(): void {
+function createMainWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 840,
@@ -35,7 +36,9 @@ function createWindow(): void {
     }
   })
 
+  const mainWebContentsId = mainWindow.webContents.id
   mainWindow.on('closed', () => {
+    removeChatSession(mainWebContentsId)
     mainWindow = null
   })
 
@@ -45,12 +48,12 @@ function createWindow(): void {
   })
 
   if (process.env.ELECTRON_RENDERER_URL) {
-    mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
+    void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
     if (process.env.ELECTRON_OPEN_DEVTOOLS === '1') {
       mainWindow.webContents.openDevTools({ mode: 'detach' })
     }
   } else {
-    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    void mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
 }
 
@@ -58,18 +61,12 @@ app.whenReady().then(async () => {
   const userData = app.getPath('userData')
   project.settings = await loadSettings(userData)
 
-  registerIpc(
-    project,
-    versionStore,
-    memoryService,
-    () => userData,
-    () => mainWindow
-  )
+  registerIpc(project, versionStore, memoryService, () => userData)
 
-  createWindow()
+  createMainWindow()
 
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    if (BrowserWindow.getAllWindows().length === 0) createMainWindow()
   })
 })
 

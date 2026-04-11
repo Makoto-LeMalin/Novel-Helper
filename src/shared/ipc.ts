@@ -2,8 +2,11 @@
 
 export type WorkspaceInfo = {
   path: string
+  /** Conversation branch for this window (messages / sendChat). */
   currentBranchId: string
   currentNodeId: string
+  /** Branch whose tip matches files on disk after last setBranch/restore. */
+  workspaceBranchId: string
   pendingForkBeforeNextCommit: boolean
   /** True when conversation list is capped to a restored node's cut. */
   historyViewActive: boolean
@@ -68,3 +71,6 @@ export const CHAT_ERROR_CHANNEL = 'novel:chat-error'
 export const FLUSH_EDITOR_REQUEST_CHANNEL = 'novel:flush-editor-request'
 /** 渲染进程 → 主进程：参数为 requestId（与 request 一致）。 */
 export const FLUSH_EDITOR_DONE_CHANNEL = 'novel:flush-editor-done'
+
+/** Main → all renderers: on-disk workspace was restored; reload open files if needed. */
+export const WORKSPACE_RESTORED_CHANNEL = 'novel:workspace-restored'

@@ -3,6 +3,10 @@ import { randomUUID } from 'crypto'
 import { join } from 'path'
 import { existsSync, mkdirSync } from 'fs'
 import type { AppSettings } from '../../shared/ipc'
+import {
+  DEFAULT_CHAT_THREAD_ID,
+  suggestChatTabTitleFromUserText
+} from '../../shared/chat-thread'
 import type { ChatTurnBlock } from '../../shared/chat-stream'
 import {
   createEmbedding,
@@ -34,6 +38,7 @@ export class MemoryService {
   private ws: string | null = null
 
   open(workspaceRoot: string): void {
+    if (this.db && this.ws === workspaceRoot) return
     this.close()
     this.ws = workspaceRoot
     const novel = join(workspaceRoot, NOVEL)
@@ -70,6 +75,8 @@ export class MemoryService {
       CREATE INDEX IF NOT EXISTS idx_emb_branch ON embeddings(branch_id);
     `)
     this.ensureBlocksColumn()
+    this.ensureThreadIdColumn()
+    this.ensureChatThreadsTable()
   }
 
   private ensureBlocksColumn(): void {
@@ -80,6 +87,21 @@ export class MemoryService {
     if (!cols.some((c) => c.name === 'blocks')) {
       db.exec(`ALTER TABLE messages ADD COLUMN blocks TEXT`)
     }
+  }
+
+  private ensureThreadIdColumn(): void {
+    const db = this.requireDb()
+    const cols = db.prepare(`PRAGMA table_info(messages)`).all() as {
+      name: string
+    }[]
+    if (!cols.some((c) => c.name === 'thread_id')) {
+      db.exec(
+        `ALTER TABLE messages ADD COLUMN thread_id TEXT NOT NULL DEFAULT 'default'`
+      )
+    }
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_messages_branch_thread_seq ON messages(branch_id, thread_id, seq)`
+    )
   }
 
   private parseBlocks(raw: string | null | undefined): ChatTurnBlock[] | null {
@@ -131,20 +153,25 @@ export class MemoryService {
     const db = this.requireDb()
     const rows = db
       .prepare(
-        `SELECT role, content, created_at, blocks FROM messages WHERE branch_id = ? AND seq <= ? ORDER BY seq ASC`
+        `SELECT role, content, created_at, blocks, thread_id FROM messages WHERE branch_id = ? AND seq <= ? ORDER BY seq ASC`
       )
       .all(fromBranchId, maxSeqInclusive) as Array<{
       role: string
       content: string
       created_at: number
       blocks: string | null
+      thread_id: string
     }>
     let seq = 1
     const ins = db.prepare(
-      `INSERT INTO messages (id, branch_id, seq, role, content, created_at, blocks)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO messages (id, branch_id, seq, role, content, created_at, blocks, thread_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     )
     for (const r of rows) {
+      const tid =
+        typeof r.thread_id === 'string' && r.thread_id.trim().length > 0
+          ? r.thread_id.trim()
+          : DEFAULT_CHAT_THREAD_ID
       ins.run(
         randomUUID(),
         toBranchId,
@@ -152,13 +179,15 @@ export class MemoryService {
         r.role,
         r.content,
         r.created_at,
-        r.blocks
+        r.blocks,
+        tid
       )
     }
   }
 
   appendMessage(
     branchId: string,
+    threadId: string,
     role: 'user' | 'assistant' | 'system',
     content: string,
     id: string,
@@ -166,17 +195,19 @@ export class MemoryService {
   ): { seq: number } {
     const db = this.requireDb()
     const seq = this.nextSeq(branchId)
+    const tid = threadId || DEFAULT_CHAT_THREAD_ID
     const blocksJson =
       blocks != null && blocks.length > 0 ? JSON.stringify(blocks) : null
     db.prepare(
-      `INSERT INTO messages (id, branch_id, seq, role, content, created_at, blocks)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(id, branchId, seq, role, content, Date.now(), blocksJson)
+      `INSERT INTO messages (id, branch_id, seq, role, content, created_at, blocks, thread_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(id, branchId, seq, role, content, Date.now(), blocksJson, tid)
     return { seq }
   }
 
   getRecentMessages(
     branchId: string,
+    threadId: string,
     limit: number
   ): Array<{
     role: string
@@ -185,12 +216,13 @@ export class MemoryService {
     blocks: ChatTurnBlock[] | null
   }> {
     const db = this.requireDb()
+    const tid = threadId || DEFAULT_CHAT_THREAD_ID
     const rows = db
       .prepare(
-        `SELECT role, content, seq, blocks FROM messages WHERE branch_id = ?
+        `SELECT role, content, seq, blocks FROM messages WHERE branch_id = ? AND thread_id = ?
          ORDER BY seq DESC LIMIT ?`
       )
-      .all(branchId, limit)
+      .all(branchId, tid, limit)
       .reverse() as Array<{
       role: string
       content: string
@@ -207,7 +239,8 @@ export class MemoryService {
 
   getMessagesUpToSeq(
     branchId: string,
-    maxSeq: number
+    maxSeq: number,
+    threadId: string
   ): Array<{
     role: string
     content: string
@@ -215,12 +248,13 @@ export class MemoryService {
     blocks: ChatTurnBlock[] | null
   }> {
     const db = this.requireDb()
+    const tid = threadId || DEFAULT_CHAT_THREAD_ID
     const rows = db
       .prepare(
-        `SELECT role, content, seq, blocks FROM messages WHERE branch_id = ? AND seq <= ?
+        `SELECT role, content, seq, blocks FROM messages WHERE branch_id = ? AND thread_id = ? AND seq <= ?
          ORDER BY seq ASC`
       )
-      .all(branchId, maxSeq) as Array<{
+      .all(branchId, tid, maxSeq) as Array<{
       role: string
       content: string
       seq: number
@@ -307,6 +341,7 @@ export class MemoryService {
     db.prepare(`DELETE FROM messages WHERE branch_id = ?`).run(branchId)
     db.prepare(`DELETE FROM summaries WHERE branch_id = ?`).run(branchId)
     db.prepare(`DELETE FROM embeddings WHERE branch_id = ?`).run(branchId)
+    db.prepare(`DELETE FROM chat_threads WHERE branch_id = ?`).run(branchId)
   }
 
   /**
@@ -331,6 +366,7 @@ export class MemoryService {
   async onUserMessagePersisted(
     settings: AppSettings,
     branchId: string,
+    threadId: string,
     userContent: string
   ): Promise<void> {
     if (!settings.memoryEnabled || !settings.openAiApiKey) return
@@ -349,20 +385,28 @@ export class MemoryService {
     }
 
     const db = this.requireDb()
+    const tid = threadId || DEFAULT_CHAT_THREAD_ID
     const count = db
-      .prepare(`SELECT COUNT(*) as c FROM messages WHERE branch_id = ?`)
-      .get(branchId) as { c: number }
+      .prepare(
+        `SELECT COUNT(*) as c FROM messages WHERE branch_id = ? AND thread_id = ?`
+      )
+      .get(branchId, tid) as { c: number }
     const n = settings.memorySummaryEveryN
     if (n > 0 && count.c > 0 && count.c % n === 0) {
-      await this.rollSummary(settings, branchId)
+      await this.rollSummary(settings, branchId, tid)
     }
   }
 
   private async rollSummary(
     settings: AppSettings,
-    branchId: string
+    branchId: string,
+    threadId: string
   ): Promise<void> {
-    const recent = this.getRecentMessages(branchId, settings.memorySummaryEveryN)
+    const recent = this.getRecentMessages(
+      branchId,
+      threadId,
+      settings.memorySummaryEveryN
+    )
     if (recent.length === 0) return
     const minSeq = Math.min(...recent.map((m) => m.seq))
     const maxSeq = Math.max(...recent.map((m) => m.seq))
@@ -402,12 +446,14 @@ export class MemoryService {
   async buildAugmentedMessages(
     settings: AppSettings,
     branchId: string,
+    threadId: string,
     filePath: string | null,
     fileContext: string,
     userMessage: string
   ): Promise<ChatMessage[]> {
     const recent = this.getRecentMessages(
       branchId,
+      threadId || DEFAULT_CHAT_THREAD_ID,
       settings.memoryRecentMessages
     )
     const summary = this.latestSummary(branchId)
@@ -469,5 +515,221 @@ export class MemoryService {
     }
     messages.push({ role: 'user', content: userMessage })
     return messages
+  }
+
+  private ensureChatThreadsTable(): void {
+    const db = this.requireDb()
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS chat_threads (
+        branch_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        closed INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (branch_id, thread_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_chat_threads_branch_closed_sort
+        ON chat_threads (branch_id, closed, sort_order);
+    `)
+  }
+
+  getFirstUserMessageContent(
+    branchId: string,
+    threadId: string
+  ): string | null {
+    const db = this.requireDb()
+    const row = db
+      .prepare(
+        `SELECT content FROM messages WHERE branch_id = ? AND thread_id = ? AND role = 'user' ORDER BY seq ASC LIMIT 1`
+      )
+      .get(branchId, threadId) as { content: string } | undefined
+    return row?.content ?? null
+  }
+
+  syncChatThreadsFromMessages(branchId: string): void {
+    this.ensureChatThreadsTable()
+    const db = this.requireDb()
+    db.prepare(
+      `DELETE FROM chat_threads WHERE branch_id = ? AND NOT EXISTS (
+        SELECT 1 FROM messages m
+        WHERE m.branch_id = chat_threads.branch_id AND m.thread_id = chat_threads.thread_id
+      )`
+    ).run(branchId)
+    const tids = db
+      .prepare(
+        `SELECT DISTINCT thread_id AS tid FROM messages WHERE branch_id = ?`
+      )
+      .all(branchId) as { tid: string }[]
+    const exists = db.prepare(
+      `SELECT 1 AS x FROM chat_threads WHERE branch_id = ? AND thread_id = ? LIMIT 1`
+    )
+    const maxRow = db
+      .prepare(
+        `SELECT COALESCE(MAX(sort_order), -1) AS m FROM chat_threads WHERE branch_id = ?`
+      )
+      .get(branchId) as { m: number }
+    let maxSort = maxRow.m
+    const ins = db.prepare(
+      `INSERT INTO chat_threads (branch_id, thread_id, title, sort_order, closed, created_at)
+       VALUES (?, ?, ?, ?, 0, ?)`
+    )
+    const now = Date.now()
+    for (const { tid } of tids) {
+      if (exists.get(branchId, tid)) continue
+      maxSort += 1
+      const raw = this.getFirstUserMessageContent(branchId, tid)
+      const title = raw ? suggestChatTabTitleFromUserText(raw) : '新对话'
+      ins.run(branchId, tid, title, maxSort, now)
+    }
+  }
+
+  countOpenChatThreads(branchId: string): number {
+    this.ensureChatThreadsTable()
+    const db = this.requireDb()
+    const row = db
+      .prepare(
+        `SELECT COUNT(DISTINCT m.thread_id) AS c
+         FROM messages m
+         LEFT JOIN chat_threads c
+           ON c.branch_id = m.branch_id AND c.thread_id = m.thread_id
+         WHERE m.branch_id = ?
+           AND (c.thread_id IS NULL OR c.closed = 0)`
+      )
+      .get(branchId) as { c: number }
+    return row.c
+  }
+
+  /**
+   * 首条用户消息写入前物化标签行（避免预创建空 tab）。
+   * 若行已存在且曾关闭，则重新打开。
+   */
+  ensureChatThreadForFirstUserMessage(
+    branchId: string,
+    threadId: string,
+    firstUserText: string
+  ): void {
+    this.ensureChatThreadsTable()
+    const db = this.requireDb()
+    const row = db
+      .prepare(
+        `SELECT closed FROM chat_threads WHERE branch_id = ? AND thread_id = ?`
+      )
+      .get(branchId, threadId) as { closed: number } | undefined
+    if (row) {
+      if (row.closed === 1) {
+        const mx = db
+          .prepare(
+            `SELECT COALESCE(MAX(sort_order), -1) AS m FROM chat_threads WHERE branch_id = ?`
+          )
+          .get(branchId) as { m: number }
+        const nextSort = mx.m + 1
+        db.prepare(
+          `UPDATE chat_threads SET closed = 0, sort_order = ? WHERE branch_id = ? AND thread_id = ?`
+        ).run(nextSort, branchId, threadId)
+      }
+      return
+    }
+    const title = suggestChatTabTitleFromUserText(firstUserText)
+    const mx = db
+      .prepare(
+        `SELECT COALESCE(MAX(sort_order), -1) AS m FROM chat_threads WHERE branch_id = ?`
+      )
+      .get(branchId) as { m: number }
+    const sort = mx.m + 1
+    const now = Date.now()
+    db.prepare(
+      `INSERT INTO chat_threads (branch_id, thread_id, title, sort_order, closed, created_at)
+       VALUES (?, ?, ?, ?, 0, ?)`
+    ).run(branchId, threadId, title, sort, now)
+  }
+
+  setChatThreadClosed(
+    branchId: string,
+    threadId: string,
+    closed: boolean
+  ): void {
+    this.ensureChatThreadsTable()
+    const db = this.requireDb()
+    if (closed && this.countOpenChatThreads(branchId) <= 1) {
+      throw new Error('LAST_OPEN_CHAT_THREAD')
+    }
+    if (closed) {
+      db.prepare(
+        `UPDATE chat_threads SET closed = 1 WHERE branch_id = ? AND thread_id = ?`
+      ).run(branchId, threadId)
+      return
+    }
+    const mx = db
+      .prepare(
+        `SELECT COALESCE(MAX(sort_order), -1) AS m FROM chat_threads WHERE branch_id = ?`
+      )
+      .get(branchId) as { m: number }
+    const nextSort = mx.m + 1
+    db.prepare(
+      `UPDATE chat_threads SET closed = 0, sort_order = ? WHERE branch_id = ? AND thread_id = ?`
+    ).run(nextSort, branchId, threadId)
+  }
+
+  updateChatThreadTitle(
+    branchId: string,
+    threadId: string,
+    title: string
+  ): void {
+    this.ensureChatThreadsTable()
+    const db = this.requireDb()
+    const t = title.trim().slice(0, 200) || '新对话'
+    db.prepare(
+      `UPDATE chat_threads SET title = ? WHERE branch_id = ? AND thread_id = ?`
+    ).run(t, branchId, threadId)
+  }
+
+  getChatTabState(branchId: string): {
+    branchId: string
+    open: Array<{ threadId: string; title: string }>
+    closed: Array<{ threadId: string; title: string }>
+  } {
+    this.ensureChatThreadsTable()
+    this.syncChatThreadsFromMessages(branchId)
+    const db = this.requireDb()
+    const openRows = db
+      .prepare(
+        `SELECT m.thread_id AS threadId,
+                COALESCE(c.title, '') AS storedTitle,
+                MAX(m.seq) AS lastSeq
+         FROM messages m
+         LEFT JOIN chat_threads c
+           ON c.branch_id = m.branch_id AND c.thread_id = m.thread_id
+         WHERE m.branch_id = ?
+           AND (c.thread_id IS NULL OR c.closed = 0)
+         GROUP BY m.thread_id
+         ORDER BY lastSeq DESC`
+      )
+      .all(branchId) as Array<{
+      threadId: string
+      storedTitle: string
+      lastSeq: number
+    }>
+    const open = openRows.map((row) => {
+      let title = row.storedTitle.trim()
+      if (!title || title === '新对话') {
+        const raw = this.getFirstUserMessageContent(branchId, row.threadId)
+        title = raw ? suggestChatTabTitleFromUserText(raw) : '新对话'
+      }
+      return { threadId: row.threadId, title }
+    })
+    const closed = db
+      .prepare(
+        `SELECT c.thread_id AS threadId, c.title
+         FROM chat_threads c
+         WHERE c.branch_id = ? AND c.closed = 1
+           AND EXISTS (
+             SELECT 1 FROM messages m
+             WHERE m.branch_id = c.branch_id AND m.thread_id = c.thread_id
+           )
+         ORDER BY c.created_at DESC`
+      )
+      .all(branchId) as Array<{ threadId: string; title: string }>
+    return { branchId, open, closed }
   }
 }

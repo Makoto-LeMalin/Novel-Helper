@@ -129,6 +129,7 @@ export class SnapshotVersionStore {
     const main = branches.find((b) => b.name === 'main') ?? branches[0]
     if (!main) return
     const tipId = main.tipNodeId
+    if (!this.nodeExists(tipId)) return
     const node = this.getNode(tipId)
     if (node.label !== 'Initial') return
     if (Object.keys(node.manifest).length > 0) return
@@ -166,6 +167,15 @@ export class SnapshotVersionStore {
       nodeId,
       branchId
     )
+  }
+
+  /** 用于处理会话里残留的旧 nodeId（例如节点已从 DAG 删除）。 */
+  nodeExists(nodeId: string): boolean {
+    const db = this.requireDb()
+    const row = db
+      .prepare(`SELECT 1 AS x FROM nodes WHERE id = ? LIMIT 1`)
+      .get(nodeId) as { x: number } | undefined
+    return row != null
   }
 
   getNode(nodeId: string): NodeRecord & {
@@ -367,6 +377,10 @@ export class SnapshotVersionStore {
   /** Compare workspace files to a specific version node's manifest (not necessarily branch tip). */
   async isWorkspaceDirtyAgainstNode(nodeId: string): Promise<boolean> {
     this.requireWs()
+    if (!this.nodeExists(nodeId)) {
+      /* 基准快照缺失时无法比对，视为有未对齐风险，避免静默报「干净」。 */
+      return true
+    }
     const { manifest } = this.getNode(nodeId)
     const current = await this.buildManifestFromWorkspace()
     const keys = new Set([

@@ -9,6 +9,17 @@ export type ChatMessageRow = {
   blocks?: ChatTurnBlock[] | null
 }
 
+export type ChatThreadTabInfo = {
+  threadId: string
+  title: string
+}
+
+export type ChatTabState = {
+  branchId: string
+  open: ChatThreadTabInfo[]
+  closed: ChatThreadTabInfo[]
+}
+
 export type NovelApi = {
   selectWorkspace: () => Promise<WorkspaceInfo | null>
   getWorkspace: () => Promise<WorkspaceInfo | null>
@@ -17,7 +28,10 @@ export type NovelApi = {
   writeFile: (relPath: string, content: string) => Promise<boolean>
   listTree: () => Promise<string[]>
   versionGraph: () => Promise<VersionGraph>
-  checkpoint: (label: string) => Promise<{ nodeId: string }>
+  checkpoint: (
+    label: string,
+    chatBranchId?: string | null
+  ) => Promise<{ nodeId: string }>
   checkpointWithNewBranch: (payload: {
     newBranchName: string
     label: string
@@ -33,17 +47,39 @@ export type NovelApi = {
   ) => Promise<{ conversationCutSeq: number; branchId: string }>
   clearHistoryView: () => Promise<boolean>
   versionStatus: () => Promise<VersionStatus>
-  getMessages: () => Promise<ChatMessageRow[]>
+  getMessages: (
+    chatBranchId?: string | null,
+    chatThreadId?: string | null
+  ) => Promise<ChatMessageRow[]>
   getSettings: () => Promise<AppSettings>
   setSettings: (partial: Partial<AppSettings>) => Promise<AppSettings>
   sendChat: (payload: {
     text: string
     filePath: string | null
+    chatBranchId?: string | null
+    chatThreadId?: string | null
   }) => Promise<void>
+  cancelChat: () => Promise<void>
+  newChatThread: () => Promise<
+    | { ok: true; branchId: string; threadId: string }
+    | { ok: false; error: string }
+  >
+  getChatTabState: (chatBranchId?: string | null) => Promise<ChatTabState>
+  setChatThreadClosed: (
+    branchId: string,
+    threadId: string,
+    closed: boolean
+  ) => Promise<{ ok: true } | { ok: false; error: 'last_open' }>
+  updateChatThreadTitle: (
+    branchId: string,
+    threadId: string,
+    title: string
+  ) => Promise<{ ok: true }>
   onChatChunk: (cb: (chunk: string) => void) => () => void
   onChatStreamEvent: (cb: (ev: ChatStreamEvent) => void) => () => void
   onChatDone: (cb: (full: string) => void) => () => void
   onChatError: (cb: (msg: string) => void) => () => void
+  onWorkspaceRestored: (cb: () => void) => () => void
   /**
    * 注册由主进程在 AI 执行 patch 前通过 invoke 触发的回调：将当前打开文件的编辑器缓冲写入磁盘。
    * 传 null 可清除。
