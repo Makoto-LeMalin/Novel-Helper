@@ -1,7 +1,7 @@
 import { BrowserWindow, ipcMain, dialog, type WebContents } from 'electron'
 import { existsSync } from 'fs'
-import { join, relative } from 'path'
-import { readdir, readFile, stat } from 'fs/promises'
+import { join } from 'path'
+import { readFile, stat } from 'fs/promises'
 import type { ProjectState } from '../state/project-state'
 import { SnapshotVersionStore } from '../version/snapshot-version-store'
 import { MemoryService } from '../memory/memory-service'
@@ -26,20 +26,27 @@ import {
   saveSessionSnapshot
 } from '../persistence/session-store'
 import {
+  createWorkspaceDir,
+  createWorkspaceFile,
+  deleteWorkspaceEntry,
   deleteWorkspaceFileIfExists,
   isUnderNovel,
+  listWorkspaceFiles,
   listWorkspaceFilesWithPrefix,
   patchWorkspaceFile,
   readWorkspaceFileForTool,
+  renameWorkspaceEntry,
   searchWorkspaceLiteral,
   writeWorkspaceFile
 } from '../files/file-service'
+import { createWorkspaceTreeWatcher } from '../files/workspace-tree-watcher'
 import {
   CHAT_DONE_CHANNEL,
   CHAT_ERROR_CHANNEL,
   FLUSH_EDITOR_REQUEST_CHANNEL,
   FLUSH_EDITOR_DONE_CHANNEL,
   WORKSPACE_RESTORED_CHANNEL,
+  WORKSPACE_TREE_CHANGED_CHANNEL,
   type AppSettings,
   type WorkspaceInfo
 } from '../../shared/ipc'
@@ -227,6 +234,14 @@ export function registerIpc(
   memory: MemoryService,
   getUserData: () => string
 ): void {
+  const treeWatcher = createWorkspaceTreeWatcher(() => {
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (!w.isDestroyed()) {
+        w.webContents.send(WORKSPACE_TREE_CHANGED_CHANNEL)
+      }
+    }
+  })
+
   ipcMain.handle('novel:selectWorkspace', async () => {
     const win = dialogParentWindow()
     /* Workspace root = all relative paths (files, AI tool `path`, tree) are under this folder.
@@ -236,7 +251,15 @@ export function registerIpc(
       properties: ['openDirectory']
     })
     if (canceled || !filePaths[0]) return null
-    return openWorkspaceCore(project, version, memory, filePaths[0], 'fresh')
+    const w = await openWorkspaceCore(
+      project,
+      version,
+      memory,
+      filePaths[0],
+      'fresh'
+    )
+    treeWatcher.setRoot(project.workspacePath)
+    return w
   })
 
   ipcMain.handle(
@@ -268,6 +291,7 @@ export function registerIpc(
               snap.pendingForkBeforeNextCommit ?? false
           }
         )
+        treeWatcher.setRoot(project.workspacePath)
         return {
           ok: true,
           workspace: w,
@@ -352,24 +376,52 @@ export function registerIpc(
 
   ipcMain.handle('novel:listTree', async () => {
     if (!project.workspacePath) return []
-    const root = project.workspacePath
-    async function walk(dir: string): Promise<string[]> {
-      const out: string[] = []
-      const entries = await readdir(dir, { withFileTypes: true })
-      for (const e of entries) {
-        const full = join(dir, e.name)
-        const rel = relative(root, full).split(/[/\\]/).join('/')
-        if (isUnderNovel(rel)) continue
-        if (e.isDirectory()) {
-          out.push(...(await walk(full)))
-        } else {
-          out.push(rel)
-        }
-      }
-      return out
-    }
-    return walk(root).then((r) => r.sort())
+    return listWorkspaceFiles(project.workspacePath)
   })
+
+  ipcMain.handle(
+    'novel:createWorkspaceFile',
+    async (_e, relPath: string) => {
+      if (!project.workspacePath) {
+        return { ok: false as const, error: 'No workspace' }
+      }
+      return createWorkspaceFile(project.workspacePath, relPath)
+    }
+  )
+
+  ipcMain.handle(
+    'novel:createWorkspaceFolder',
+    async (_e, relPath: string) => {
+      if (!project.workspacePath) {
+        return { ok: false as const, error: 'No workspace' }
+      }
+      return createWorkspaceDir(project.workspacePath, relPath)
+    }
+  )
+
+  ipcMain.handle(
+    'novel:deleteWorkspacePath',
+    async (_e, relPath: string) => {
+      if (!project.workspacePath) {
+        return { ok: false as const, error: 'No workspace' }
+      }
+      return deleteWorkspaceEntry(project.workspacePath, relPath)
+    }
+  )
+
+  ipcMain.handle(
+    'novel:renameWorkspacePath',
+    async (_e, fromRel: string, toRel: string) => {
+      if (!project.workspacePath) {
+        return { ok: false as const, error: 'No workspace' }
+      }
+      return renameWorkspaceEntry(
+        project.workspacePath,
+        fromRel,
+        toRel
+      )
+    }
+  )
 
   ipcMain.handle('novel:versionGraph', async () => version.getGraph())
 

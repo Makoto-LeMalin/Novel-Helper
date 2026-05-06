@@ -74,3 +74,6 @@ export const FLUSH_EDITOR_DONE_CHANNEL = 'novel:flush-editor-done'
 
 /** Main → all renderers: on-disk workspace was restored; reload open files if needed. */
 export const WORKSPACE_RESTORED_CHANNEL = 'novel:workspace-restored'
+
+/** Main → all renderers: workspace file tree may have changed (external or in-app). */
+export const WORKSPACE_TREE_CHANGED_CHANNEL = 'novel:workspace-tree-changed'

@@ -16,7 +16,8 @@ import {
   CHAT_ERROR_CHANNEL,
   FLUSH_EDITOR_REQUEST_CHANNEL,
   FLUSH_EDITOR_DONE_CHANNEL,
-  WORKSPACE_RESTORED_CHANNEL
+  WORKSPACE_RESTORED_CHANNEL,
+  WORKSPACE_TREE_CHANGED_CHANNEL
 } from '../shared/ipc'
 
 let editorFlushHandler: (() => Promise<void>) | null = null
@@ -47,6 +48,14 @@ const novel: NovelApi = {
   writeFile: (relPath: string, content: string): Promise<boolean> =>
     ipcRenderer.invoke('novel:writeFile', relPath, content),
   listTree: (): Promise<string[]> => ipcRenderer.invoke('novel:listTree'),
+  createWorkspaceFile: (relPath: string) =>
+    ipcRenderer.invoke('novel:createWorkspaceFile', relPath),
+  createWorkspaceFolder: (relPath: string) =>
+    ipcRenderer.invoke('novel:createWorkspaceFolder', relPath),
+  deleteWorkspacePath: (relPath: string) =>
+    ipcRenderer.invoke('novel:deleteWorkspacePath', relPath),
+  renameWorkspacePath: (fromRel: string, toRel: string) =>
+    ipcRenderer.invoke('novel:renameWorkspacePath', fromRel, toRel),
   versionGraph: (): Promise<VersionGraph> =>
     ipcRenderer.invoke('novel:versionGraph'),
   checkpoint: (
@@ -138,6 +147,11 @@ const novel: NovelApi = {
     const fn = () => cb()
     ipcRenderer.on(WORKSPACE_RESTORED_CHANNEL, fn)
     return () => ipcRenderer.removeListener(WORKSPACE_RESTORED_CHANNEL, fn)
+  },
+  onWorkspaceTreeChanged: (cb: () => void): (() => void) => {
+    const fn = () => cb()
+    ipcRenderer.on(WORKSPACE_TREE_CHANGED_CHANNEL, fn)
+    return () => ipcRenderer.removeListener(WORKSPACE_TREE_CHANGED_CHANNEL, fn)
   },
   setEditorFlushHandler: (fn: (() => Promise<void>) | null): void => {
     editorFlushHandler = fn

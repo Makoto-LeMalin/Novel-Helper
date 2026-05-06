@@ -1,5 +1,14 @@
 import { createHash } from 'crypto'
-import { readdir, readFile, writeFile, mkdir, rm, unlink } from 'fs/promises'
+import {
+  readdir,
+  readFile,
+  writeFile,
+  mkdir,
+  rm,
+  unlink,
+  rename,
+  stat
+} from 'fs/promises'
 import { join, relative, sep } from 'path'
 
 const NOVEL_DIR = '.novel'
@@ -176,6 +185,103 @@ export async function searchWorkspaceLiteral(
     }
   }
   return { ok: true, hits, truncated: hits.length >= maxHits }
+}
+
+export async function createWorkspaceFile(
+  workspaceRoot: string,
+  relPath: string
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const n = normalizeSafeWorkspaceRelPath(relPath)
+  if (!n) return { ok: false, error: 'Invalid path' }
+  const full = join(workspaceRoot, n)
+  try {
+    await mkdir(join(full, '..'), { recursive: true })
+    await writeFile(full, '', { flag: 'wx' })
+    return { ok: true }
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code
+    if (code === 'EEXIST') {
+      return { ok: false, error: 'File already exists' }
+    }
+    return {
+      ok: false,
+      error: e instanceof Error ? e.message : String(e)
+    }
+  }
+}
+
+export async function createWorkspaceDir(
+  workspaceRoot: string,
+  relPath: string
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const n = normalizeSafeWorkspaceRelPath(relPath)
+  if (!n) return { ok: false, error: 'Invalid path' }
+  const full = join(workspaceRoot, n)
+  try {
+    await mkdir(full, { recursive: true })
+    return { ok: true }
+  } catch (e) {
+    return {
+      ok: false,
+      error: e instanceof Error ? e.message : String(e)
+    }
+  }
+}
+
+export async function deleteWorkspaceEntry(
+  workspaceRoot: string,
+  relPath: string
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const n = normalizeSafeWorkspaceRelPath(relPath)
+  if (!n) return { ok: false, error: 'Invalid path' }
+  const full = join(workspaceRoot, n)
+  try {
+    const st = await stat(full)
+    if (st.isDirectory()) {
+      await rm(full, { recursive: true, force: true })
+    } else {
+      await unlink(full)
+    }
+    return { ok: true }
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') {
+      return { ok: false, error: 'Path does not exist' }
+    }
+    return {
+      ok: false,
+      error: e instanceof Error ? e.message : String(e)
+    }
+  }
+}
+
+export async function renameWorkspaceEntry(
+  workspaceRoot: string,
+  fromRel: string,
+  toRel: string
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const a = normalizeSafeWorkspaceRelPath(fromRel)
+  const b = normalizeSafeWorkspaceRelPath(toRel)
+  if (!a || !b) return { ok: false, error: 'Invalid path' }
+  const fromFull = join(workspaceRoot, a)
+  const toFull = join(workspaceRoot, b)
+  try {
+    await mkdir(join(toFull, '..'), { recursive: true })
+    await rename(fromFull, toFull)
+    return { ok: true }
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') {
+      return { ok: false, error: 'Source path does not exist' }
+    }
+    if (code === 'EEXIST') {
+      return { ok: false, error: 'Destination already exists' }
+    }
+    return {
+      ok: false,
+      error: e instanceof Error ? e.message : String(e)
+    }
+  }
 }
 
 export async function deleteWorkspaceFileIfExists(

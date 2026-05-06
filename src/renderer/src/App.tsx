@@ -4,8 +4,10 @@ import {
   useMemo,
   useRef,
   useState,
+  type MouseEvent,
   type ReactNode
 } from 'react'
+import { createPortal } from 'react-dom'
 import Editor from '@monaco-editor/react'
 import type * as Monaco from 'monaco-editor'
 import type {
@@ -267,20 +269,33 @@ function FileTreeBranch({
   expanded,
   toggleDir,
   activeFile,
-  onOpenFile
+  onOpenFile,
+  onContextMenu
 }: {
   root: FsDir
   expanded: Set<string>
   toggleDir: (rel: string) => void
   activeFile: string | null
   onOpenFile: (p: string) => void
+  onContextMenu?: (
+    e: MouseEvent,
+    target: { kind: 'file'; path: string } | { kind: 'dir'; rel: string }
+  ) => void
 }): React.ReactElement {
   const listClass = root.rel ? 'file-tree-nested file-tree' : 'file-tree'
   return (
     <ul className={listClass}>
       {root.children.map((c) =>
         c.kind === 'file' ? (
-          <li key={c.path} className="file-tree-item">
+          <li
+            key={c.path}
+            className="file-tree-item"
+            onContextMenu={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              onContextMenu?.(e, { kind: 'file', path: c.path })
+            }}
+          >
             <div
               className={[
                 'file-tree-file',
@@ -302,7 +317,19 @@ function FileTreeBranch({
             </div>
           </li>
         ) : (
-          <li key={c.rel} className="file-tree-item">
+          <li
+            key={c.rel}
+            className="file-tree-item"
+            onContextMenu={(e) => {
+              /* 嵌套子树内的右键交给子项，勿当成当前文件夹 */
+              if ((e.target as HTMLElement).closest('.file-tree-nested')) {
+                return
+              }
+              e.preventDefault()
+              e.stopPropagation()
+              onContextMenu?.(e, { kind: 'dir', rel: c.rel })
+            }}
+          >
             <div
               className="file-tree-dir-head"
               onClick={() => toggleDir(c.rel)}
@@ -327,6 +354,7 @@ function FileTreeBranch({
                 toggleDir={toggleDir}
                 activeFile={activeFile}
                 onOpenFile={onOpenFile}
+                onContextMenu={onContextMenu}
               />
             ) : null}
           </li>
@@ -344,6 +372,34 @@ function novelOrThrow(): NovelApi {
 
 function normRelPath(p: string): string {
   return p.replace(/\\/g, '/').replace(/^\//, '').trim()
+}
+
+function parentRelPath(p: string): string {
+  const n = normRelPath(p)
+  const i = n.lastIndexOf('/')
+  return i === -1 ? '' : n.slice(0, i)
+}
+
+function joinRelPath(parent: string, child: string): string {
+  const c = normRelPath(child)
+  if (!parent) return c
+  return `${normRelPath(parent)}/${c}`
+}
+
+function basenameRel(p: string): string {
+  const n = normRelPath(p)
+  const i = n.lastIndexOf('/')
+  return i === -1 ? n : n.slice(i + 1)
+}
+
+/** 拒绝空段、`.`、`..`；允许 `a/b/c` 形式。 */
+function isSafeRelPathInput(rel: string): boolean {
+  const n = normRelPath(rel)
+  if (!n) return false
+  for (const seg of n.split('/')) {
+    if (seg === '' || seg === '.' || seg === '..') return false
+  }
+  return true
 }
 
 function viewFromEditor(
@@ -418,6 +474,34 @@ export default function App(): React.ReactElement {
     defaultName: string
   }>({ open: false, defaultName: '' })
   const chatForkInputRef = useRef<HTMLInputElement>(null)
+  const [fileTreeCtx, setFileTreeCtx] = useState<{
+    x: number
+    y: number
+    target:
+      | { kind: 'file'; path: string }
+      | { kind: 'dir'; rel: string }
+  } | null>(null)
+  const fileNameModalKeyRef = useRef(0)
+  const [fileNameModal, setFileNameModal] = useState<
+    | { open: false }
+    | { open: true; title: string; initialValue: string; inputKey: number }
+  >({ open: false })
+  const fileNameSubmitRef = useRef<(value: string) => Promise<void> | void>(
+    null
+  )
+  const fileNameInputRef = useRef<HTMLInputElement>(null)
+  const [fileDeleteConfirm, setFileDeleteConfirm] = useState<{
+    path: string
+    isDir: boolean
+  } | null>(null)
+  const fileDeletePendingRef = useRef<{
+    path: string
+    isDir: boolean
+  } | null>(null)
+  const [fileTreeBanner, setFileTreeBanner] = useState<string | null>(null)
+  const fileTreeBannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  )
   const pendingChatPayloadRef = useRef<{
     text: string
     filePath: string | null
@@ -459,6 +543,17 @@ export default function App(): React.ReactElement {
     if (!window.novel) return
     const list = await novelOrThrow().listTree()
     setFiles(list)
+  }, [])
+
+  const showFileTreeBanner = useCallback((msg: string) => {
+    if (fileTreeBannerTimerRef.current != null) {
+      clearTimeout(fileTreeBannerTimerRef.current)
+    }
+    setFileTreeBanner(msg)
+    fileTreeBannerTimerRef.current = setTimeout(() => {
+      setFileTreeBanner(null)
+      fileTreeBannerTimerRef.current = null
+    }, 4800)
   }, [])
 
   const fileTree = useMemo(() => buildFileTree(files), [files])
@@ -529,6 +624,268 @@ export default function App(): React.ReactElement {
       else next.add(rel)
       return next
     })
+  }, [])
+
+  const ensureDirExpanded = useCallback((rel: string) => {
+    if (!rel) return
+    setExpandedDirs((prev) => new Set([...prev, rel]))
+  }, [])
+
+  const openFileNameModal = useCallback(
+    (
+      title: string,
+      initialValue: string,
+      onSubmit: (value: string) => Promise<void> | void
+    ): void => {
+      fileNameModalKeyRef.current += 1
+      fileNameSubmitRef.current = onSubmit
+      setFileNameModal({
+        open: true,
+        title,
+        initialValue,
+        inputKey: fileNameModalKeyRef.current
+      })
+    },
+    []
+  )
+
+  const closeFileNameModal = useCallback((): void => {
+    setFileNameModal({ open: false })
+    fileNameSubmitRef.current = null
+  }, [])
+
+  const confirmFileNameModal = useCallback(async (): Promise<void> => {
+    if (!fileNameModal.open) return
+    const raw = fileNameInputRef.current?.value?.trim() ?? ''
+    if (!raw) {
+      showFileTreeBanner('名称不能为空')
+      return
+    }
+    const fn = fileNameSubmitRef.current
+    if (fn) await fn(raw)
+    closeFileNameModal()
+  }, [fileNameModal.open, closeFileNameModal, showFileTreeBanner])
+
+  const pruneBuffersUnderPrefix = useCallback((dirRel: string): void => {
+    const d = normRelPath(dirRel)
+    if (!d) return
+    const pre = `${d}/`
+    for (const k of [...fileBuffersRef.current.keys()]) {
+      if (k === d || k.startsWith(pre)) {
+        fileBuffersRef.current.delete(k)
+      }
+    }
+  }, [])
+
+  const renameBuffersTreePrefix = useCallback(
+    (fromDir: string, toDir: string): void => {
+      const a = normRelPath(fromDir)
+      const b = normRelPath(toDir)
+      if (!a || !b) return
+      const pre = `${a}/`
+      for (const [k, v] of [...fileBuffersRef.current.entries()]) {
+        if (k === a || k.startsWith(pre)) {
+          const rest = k === a ? '' : k.slice(a.length + 1)
+          const nk = rest ? `${b}/${rest}` : b
+          fileBuffersRef.current.delete(k)
+          fileBuffersRef.current.set(nk, v)
+        }
+      }
+    },
+    []
+  )
+
+  const startNewFileInDir = useCallback(
+    (parentRel: string) => {
+      setFileTreeCtx(null)
+      ensureDirExpanded(parentRel)
+      openFileNameModal(
+        '新建文件（可含子路径，例如 notes/ch1.md）',
+        '',
+        async (name) => {
+          const rel = joinRelPath(parentRel, name)
+          if (!isSafeRelPathInput(rel)) {
+            showFileTreeBanner('路径无效：不得包含 .. 或空段')
+            return
+          }
+          const r = await novelOrThrow().createWorkspaceFile(rel)
+          if (!r.ok) {
+            showFileTreeBanner(r.error)
+            return
+          }
+          await refreshFiles()
+        }
+      )
+    },
+    [
+      ensureDirExpanded,
+      openFileNameModal,
+      refreshFiles,
+      showFileTreeBanner
+    ]
+  )
+
+  const startNewFolderInDir = useCallback(
+    (parentRel: string) => {
+      setFileTreeCtx(null)
+      ensureDirExpanded(parentRel)
+      openFileNameModal(
+        '新建文件夹（可含子路径）',
+        '',
+        async (name) => {
+          const rel = joinRelPath(parentRel, name)
+          if (!isSafeRelPathInput(rel)) {
+            showFileTreeBanner('路径无效：不得包含 .. 或空段')
+            return
+          }
+          const r = await novelOrThrow().createWorkspaceFolder(rel)
+          if (!r.ok) {
+            showFileTreeBanner(r.error)
+            return
+          }
+          await refreshFiles()
+        }
+      )
+    },
+    [
+      ensureDirExpanded,
+      openFileNameModal,
+      refreshFiles,
+      showFileTreeBanner
+    ]
+  )
+
+  const startRenameTarget = useCallback(
+    (path: string, isDir: boolean) => {
+      setFileTreeCtx(null)
+      const base = basenameRel(path)
+      const parent = parentRelPath(path)
+      openFileNameModal('重命名', base, async (newName) => {
+        if (!isSafeRelPathInput(newName)) {
+          showFileTreeBanner('名称无效')
+          return
+        }
+        const toRel = joinRelPath(parent, newName)
+        if (!isSafeRelPathInput(toRel)) {
+          showFileTreeBanner('路径无效')
+          return
+        }
+        const r = await novelOrThrow().renameWorkspacePath(path, toRel)
+        if (!r.ok) {
+          showFileTreeBanner(r.error)
+          return
+        }
+        const af = activeFileRef.current
+        if (af) {
+          const a = normRelPath(af)
+          const op = normRelPath(path)
+          if (isDir) {
+            if (a === op || a.startsWith(`${op}/`)) {
+              if (a === op) {
+                setActiveFile(null)
+                setContent('')
+                setEditorDiskBaseline('')
+              } else {
+                const suffix = a.slice(op.length + 1)
+                setActiveFile(joinRelPath(toRel, suffix))
+              }
+            }
+          } else if (a === op) {
+            setActiveFile(toRel)
+          }
+        }
+        if (isDir) renameBuffersTreePrefix(path, toRel)
+        else {
+          const oldKey = normRelPath(path)
+          if (fileBuffersRef.current.has(oldKey)) {
+            const ent = fileBuffersRef.current.get(oldKey)!
+            fileBuffersRef.current.delete(oldKey)
+            fileBuffersRef.current.set(normRelPath(toRel), ent)
+          }
+        }
+        await refreshFiles()
+      })
+    },
+    [
+      openFileNameModal,
+      refreshFiles,
+      renameBuffersTreePrefix,
+      showFileTreeBanner
+    ]
+  )
+
+  const openDeleteConfirm = useCallback((path: string, isDir: boolean) => {
+    setFileTreeCtx(null)
+    const payload = { path, isDir }
+    fileDeletePendingRef.current = payload
+    setFileDeleteConfirm(payload)
+  }, [])
+
+  const cancelDeleteConfirm = useCallback((): void => {
+    fileDeletePendingRef.current = null
+    setFileDeleteConfirm(null)
+  }, [])
+
+  const runDeleteConfirmed = useCallback(async (): Promise<void> => {
+    const cur = fileDeletePendingRef.current
+    fileDeletePendingRef.current = null
+    setFileDeleteConfirm(null)
+    if (!cur) return
+    const { path, isDir } = cur
+    const r = await novelOrThrow().deleteWorkspacePath(path)
+    if (!r.ok) {
+      showFileTreeBanner(r.error)
+      return
+    }
+    const p = normRelPath(path)
+    const af = activeFileRef.current
+    if (af) {
+      const a = normRelPath(af)
+      if (isDir) {
+        if (a === p || a.startsWith(`${p}/`)) {
+          setActiveFile(null)
+          setContent('')
+          setEditorDiskBaseline('')
+        }
+      } else if (a === p) {
+        setActiveFile(null)
+        setContent('')
+        setEditorDiskBaseline('')
+      }
+    }
+    if (isDir) pruneBuffersUnderPrefix(path)
+    else fileBuffersRef.current.delete(p)
+    await refreshFiles()
+  }, [pruneBuffersUnderPrefix, refreshFiles, showFileTreeBanner])
+
+  useEffect(() => {
+    if (!fileTreeCtx) return
+    const close = (): void => setFileTreeCtx(null)
+    const onKey = (ev: KeyboardEvent): void => {
+      if (ev.key === 'Escape') close()
+    }
+    const onPointerDown = (ev: PointerEvent): void => {
+      if (ev.button !== 0) return
+      close()
+    }
+    const t = window.setTimeout(() => {
+      document.addEventListener('keydown', onKey, true)
+      /* 冒泡阶段：避免捕获先于菜单内 stopPropagation，导致一点击就关掉 */
+      document.addEventListener('pointerdown', onPointerDown, false)
+    }, 200)
+    return () => {
+      clearTimeout(t)
+      document.removeEventListener('keydown', onKey, true)
+      document.removeEventListener('pointerdown', onPointerDown, false)
+    }
+  }, [fileTreeCtx])
+
+  useEffect(() => {
+    return () => {
+      if (fileTreeBannerTimerRef.current != null) {
+        clearTimeout(fileTreeBannerTimerRef.current)
+      }
+    }
   }, [])
 
   const editorUnsavedToDisk =
@@ -864,6 +1221,7 @@ export default function App(): React.ReactElement {
       console.error('[novel chat error]', e)
     })
     const u4 = api.onWorkspaceRestored(async () => {
+      await refreshFiles()
       await refreshGraph()
       await refreshStatus()
       const w = await novelOrThrow().getWorkspace()
@@ -890,11 +1248,39 @@ export default function App(): React.ReactElement {
         }
       }
     })
+    const u5 = api.onWorkspaceTreeChanged(async () => {
+      await refreshFiles()
+      const af = activeFileRef.current
+      if (!af) return
+      const dirty =
+        contentRef.current !== editorDiskBaselineRef.current
+      if (dirty) {
+        showFileTreeBanner(
+          '磁盘上的文件已变更；当前编辑器有未写入修改，未自动重载。'
+        )
+        return
+      }
+      try {
+        const t = await novelOrThrow().readFile(af)
+        setContent(t)
+        setEditorDiskBaseline(t)
+        fileBuffersRef.current.set(normRelPath(af), {
+          content: t,
+          editorDiskBaseline: t,
+          ...viewFromEditor(monacoEditorRef.current)
+        })
+      } catch {
+        setActiveFile(null)
+        setContent('')
+        setEditorDiskBaseline('')
+      }
+    })
     return () => {
       u1()
       u2()
       u3()
       u4()
+      u5()
     }
   }, [
     refreshFiles,
@@ -902,7 +1288,8 @@ export default function App(): React.ReactElement {
     refreshMessages,
     refreshMessagesForTab,
     refreshStatus,
-    loadChatTabsForBranch
+    loadChatTabsForBranch,
+    showFileTreeBanner
   ])
 
   const openWorkspace = async (): Promise<void> => {
@@ -1534,6 +1921,25 @@ export default function App(): React.ReactElement {
         <button type="button" onClick={() => void openWorkspace()}>
           打开工作区
         </button>
+        {workspace ? (
+          <>
+            <span className="toolbar-sep" aria-hidden />
+            <button
+              type="button"
+              title="在工作区根目录新建文件（侧栏「文件」下也可使用）"
+              onClick={() => startNewFileInDir('')}
+            >
+              ＋ 新建文件
+            </button>
+            <button
+              type="button"
+              title="在工作区根目录新建文件夹"
+              onClick={() => startNewFolderInDir('')}
+            >
+              ＋ 新建文件夹
+            </button>
+          </>
+        ) : null}
         <button
           type="button"
           title="将编辑器内容写入磁盘（Ctrl+S / ⌘S）"
@@ -1581,8 +1987,31 @@ export default function App(): React.ReactElement {
 
       <aside className="sidebar">
         <h3>文件</h3>
+        <div className="file-tree-toolbar">
+          <button
+            type="button"
+            disabled={!workspace}
+            title="在工作区根目录新建文件"
+            onClick={() => startNewFileInDir('')}
+          >
+            新建文件
+          </button>
+          <button
+            type="button"
+            disabled={!workspace}
+            title="在工作区根目录新建文件夹"
+            onClick={() => startNewFolderInDir('')}
+          >
+            新建文件夹
+          </button>
+        </div>
+        {fileTreeBanner ? (
+          <p className="sidebar-banner">{fileTreeBanner}</p>
+        ) : null}
         {files.length === 0 ? (
-          <p className="sidebar-empty">（无文件）</p>
+          <p className="sidebar-empty">
+            {workspace ? '（无文件，可用上方按钮新建）' : '（未打开工作区）'}
+          </p>
         ) : (
           <FileTreeBranch
             root={fileTree}
@@ -1590,8 +2019,95 @@ export default function App(): React.ReactElement {
             toggleDir={toggleDir}
             activeFile={activeFile}
             onOpenFile={(p) => void openFile(p)}
+            onContextMenu={(e, target) => {
+              setFileTreeCtx({
+                x: e.clientX,
+                y: e.clientY,
+                target
+              })
+            }}
           />
         )}
+        {fileTreeCtx
+          ? createPortal(
+              <div
+                className="file-tree-ctx-root"
+                role="menu"
+                style={{
+                  position: 'fixed',
+                  left: Math.max(
+                    4,
+                    Math.min(
+                      fileTreeCtx.x,
+                      (typeof window !== 'undefined' ? window.innerWidth : 400) -
+                        200
+                    )
+                  ),
+                  top: Math.max(
+                    4,
+                    Math.min(
+                      fileTreeCtx.y,
+                      (typeof window !== 'undefined' ? window.innerHeight : 400) -
+                        180
+                    )
+                  ),
+                  zIndex: 200000
+                }}
+                onPointerDown={(e) => e.stopPropagation()}
+              >
+                {fileTreeCtx.target.kind === 'dir' ? (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      startNewFileInDir(fileTreeCtx.target.rel)
+                    }}
+                  >
+                    在此处新建文件
+                  </button>
+                ) : null}
+                {fileTreeCtx.target.kind === 'dir' ? (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      startNewFolderInDir(fileTreeCtx.target.rel)
+                    }}
+                  >
+                    在此处新建文件夹
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    const t = fileTreeCtx.target
+                    startRenameTarget(
+                      t.kind === 'file' ? t.path : t.rel,
+                      t.kind === 'dir'
+                    )
+                  }}
+                >
+                  重命名
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="danger"
+                  onClick={() => {
+                    const t = fileTreeCtx.target
+                    openDeleteConfirm(
+                      t.kind === 'file' ? t.path : t.rel,
+                      t.kind === 'dir'
+                    )
+                  }}
+                >
+                  删除…
+                </button>
+              </div>,
+              document.body
+            )
+          : null}
         <h3>分支</h3>
         <ul>
           {graph?.branches.map((b: BranchRecord) => (
@@ -1986,6 +2502,88 @@ export default function App(): React.ReactElement {
                 onClick={() => void runForkThenSendChat()}
               >
                 创建并发送
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {fileNameModal.open ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={() => closeFileNameModal()}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-labelledby="file-name-modal-title"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') closeFileNameModal()
+            }}
+          >
+            <h2 id="file-name-modal-title">{fileNameModal.title}</h2>
+            <label htmlFor="file-name-modal-input">名称</label>
+            <input
+              key={fileNameModal.inputKey}
+              ref={fileNameInputRef}
+              id="file-name-modal-input"
+              defaultValue={fileNameModal.initialValue}
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  void confirmFileNameModal()
+                }
+              }}
+            />
+            <div className="actions">
+              <button type="button" onClick={() => closeFileNameModal()}>
+                取消
+              </button>
+              <button
+                type="button"
+                className="primary"
+                onClick={() => void confirmFileNameModal()}
+              >
+                确定
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {fileDeleteConfirm ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={() => cancelDeleteConfirm()}
+        >
+          <div
+            className="modal"
+            role="dialog"
+            aria-labelledby="file-delete-modal-title"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') cancelDeleteConfirm()
+            }}
+          >
+            <h2 id="file-delete-modal-title">确认删除</h2>
+            <p className="modal-hint">
+              确定删除「{fileDeleteConfirm.path}」
+              {fileDeleteConfirm.isDir ? '（含其下全部内容）' : ''}？此操作不可撤销。
+            </p>
+            <div className="actions">
+              <button type="button" onClick={() => cancelDeleteConfirm()}>
+                取消
+              </button>
+              <button
+                type="button"
+                className="danger"
+                onClick={() => void runDeleteConfirmed()}
+              >
+                删除
               </button>
             </div>
           </div>

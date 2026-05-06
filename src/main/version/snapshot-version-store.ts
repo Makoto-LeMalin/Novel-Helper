@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3'
 import { createHash, randomUUID } from 'crypto'
 import { join } from 'path'
-import { readFile, writeFile, mkdir } from 'fs/promises'
+import { readFile, writeFile, mkdir, stat } from 'fs/promises'
 import { existsSync, mkdirSync } from 'fs'
 import {
   deleteWorkspaceFile,
@@ -11,6 +11,9 @@ import {
   writeWorkspaceFile
 } from '../files/file-service'
 import type { BranchRecord, NodeRecord, VersionGraph } from '../../shared/ipc'
+
+/** 超过此大小的文件不参与快照（不写入 manifest/blob，恢复时也不删除）。 */
+const SNAPSHOT_MAX_FILE_BYTES = 10 * 1024 * 1024
 
 const NOVEL = '.novel'
 const BLOBS = 'blobs'
@@ -275,6 +278,13 @@ export class SnapshotVersionStore {
     const files = await listWorkspaceFiles(ws)
     const manifest: Manifest = {}
     for (const rel of files) {
+      let size: number
+      try {
+        size = (await stat(join(ws, rel))).size
+      } catch {
+        continue
+      }
+      if (size > SNAPSHOT_MAX_FILE_BYTES) continue
       const buf = await readWorkspaceFile(ws, rel)
       const h = await this.storeBlob(buf)
       manifest[rel] = h
@@ -365,6 +375,12 @@ export class SnapshotVersionStore {
     const onDisk = await listWorkspaceFiles(ws)
     for (const rel of onDisk) {
       if (!keep.has(rel)) {
+        try {
+          const s = await stat(join(ws, rel))
+          if (s.isFile() && s.size > SNAPSHOT_MAX_FILE_BYTES) continue
+        } catch {
+          /* fall through to delete */
+        }
         await deleteWorkspaceFile(ws, rel)
       }
     }
